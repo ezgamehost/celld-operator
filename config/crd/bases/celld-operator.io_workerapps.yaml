@@ -83,7 +83,6 @@ spec:
                   minReplicas:
                     default: 2
                     description: minReplicas is the scale floor; keep >= 2 for HA.
-                      Also the PDB floor.
                     format: int32
                     minimum: 1
                     type: integer
@@ -93,9 +92,10 @@ spec:
                     properties:
                       p95LatencyMs:
                         description: |-
-                          p95LatencyMs adds a gateway-side latency target so traffic-bound,
-                          stateless-Worker-heavy apps scale even at low cell counts. Unset
-                          disables the latency signal.
+                          p95LatencyMs adds a latency target so traffic-bound,
+                          stateless-Worker-heavy apps scale even at low cell counts. The query
+                          reads Istio destination telemetry, so it needs Istio metrics in the
+                          same Prometheus. Unset disables the latency signal.
                         format: int32
                         minimum: 1
                         type: integer
@@ -171,8 +171,9 @@ spec:
                 type: object
               hostnames:
                 description: |-
-                  hostnames route to this app on the shared Gateway; one HTTPRoute per
-                  hostname is reconciled in the app's namespace.
+                  hostnames route to this app. One route object is reconciled in the
+                  app's namespace carrying every hostname; what kind depends on the
+                  operator's --ingress-mode.
                 items:
                   type: string
                 type: array
@@ -188,8 +189,9 @@ spec:
               resources:
                 description: |-
                   ResourcesSpec sizes one fleet pod. The operator derives the container
-                  limit, CELLD_MAX_RSS_MB (~80% of the limit, set explicitly — the upstream
-                  default is not cgroup-aware), and admission caps from these two numbers.
+                  limit, CELLD_MAX_RSS_MB (~80% of the limit, set explicitly so the ceiling
+                  is visible in the pod spec; celld would derive the same value from the
+                  cgroup limit itself), and admission caps from these two numbers.
                 properties:
                   maxResidentCells:
                     default: 1000
@@ -273,8 +275,10 @@ spec:
                 type: object
               websockets:
                 description: |-
-                  websockets selects the WebSocket ingress profile: session affinity,
-                  long idle timeouts, and conservative scale-down (docs/celld-behaviors.md).
+                  websockets selects the WebSocket profile: long edge timeouts where the
+                  ingress mode can express them (httproute and ingress; not
+                  virtualservice) and a conservative scale-down window. No session
+                  affinity is configured.
                 type: boolean
             required:
             - appVersion
@@ -388,7 +392,8 @@ spec:
                   waitingOn:
                     description: |-
                       waitingOn names the gate the rollout is blocked on, e.g.
-                      "celld-2: Ready" or "fleet: restoring=3". Empty when not waiting.
+                      "chat-celld-2: not ready" or "fleet: restoring=3". Empty when not
+                      waiting.
                     type: string
                 type: object
             type: object

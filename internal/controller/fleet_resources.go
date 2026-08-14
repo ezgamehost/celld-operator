@@ -129,8 +129,9 @@ func maxResidentCells(app *platformv1alpha1.WorkerApp) int32 {
 // is the resolved deployment version (pinned or bucket-tracked).
 func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion string) corev1.PodTemplateSpec {
 	memGi := memoryGi(app)
-	// Explicit RSS threshold ≈80% of the container limit: the upstream
-	// default derives from "available memory" and is not cgroup-aware (F10).
+	// Explicit RSS threshold ≈80% of the container limit. celld computes the
+	// same 80% from the cgroup limit on its own; setting it makes the ceiling
+	// visible in the pod spec and stable if that derivation ever changes.
 	rssMb := memGi * 1024 * 4 / 5
 
 	env := []corev1.EnvVar{

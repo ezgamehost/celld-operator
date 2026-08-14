@@ -53,8 +53,10 @@ under your operation), not for anonymous hostile code.
 - **A qualified object store.** celld's ownership fencing requires atomically
   enforced conditional writes (`If-None-Match: *`, `If-Match`) and
   read-after-write consistency. Qualified: Amazon S3, Cloudflare R2, Google
-  Cloud Storage, Azure Blob, Tigris. Not qualified: MinIO community edition,
-  Backblaze B2, DigitalOcean Spaces. For anything else, run
+  Cloud Storage, Tigris. Not qualified: MinIO community edition, Backblaze B2,
+  DigitalOcean Spaces, Hetzner. celld speaks only the S3 and GCS dialects, so a
+  store without an S3-compatible API (Azure Blob among them) cannot back a
+  fleet at all. For anything else, run
   [store qualification](#store-qualification) first — an unenforced condition
   silently splits cell ownership.
 - Optional, each degrading gracefully to a status condition when absent:
@@ -75,10 +77,12 @@ helm install celld-operator oci://ghcr.io/ezgamehost/charts/celld-operator \
   --set operator.ingressMode=httproute        # or virtualservice / ingress / none
 ```
 
-Every operator flag is a value — `operator.ingressMode`,
+Nearly every operator flag is a value — `operator.ingressMode`,
 `operator.istioGateways`, `operator.ingressClass`, `operator.clusterIssuer`,
 `operator.prometheusURL`, `operator.deployPollInterval`, and friends; see
-[dist/chart/values.yaml](dist/chart/values.yaml). The chart's default image
+[dist/chart/values.yaml](dist/chart/values.yaml). (`--operator-namespace`
+follows the release namespace, and the manager's own flags — leader election,
+metrics, probes — live under `controllerManager.container.args`.) The chart's default image
 tag is its `appVersion`, pinned at package time to the operator build it was
 released with.
 
@@ -177,8 +181,11 @@ rolls the fleet within one `--deploy-poll-interval` (default 60s), and
 `status.rolledOutAppVersion` reports the concrete version being served. In
 pinned mode the same read powers a `DeployTrackingReady: VersionMismatch`
 warning when the bucket pointer and the CR disagree (nodes always load the
-bucket's version). Tracking reads use the fleet's `secretRef` credentials,
-or the operator's ambient AWS identity otherwise.
+bucket's version) — but only for fleets using `secretRef` credentials; the
+operator does not read the bucket for `iamRole` fleets. Tracking reads use the
+fleet's `secretRef` credentials, or the operator's ambient AWS identity
+otherwise, and support `s3://` buckets only: a `gs://` fleet must pin
+`appVersion`.
 
 The operator then runs a **gated rolling update**, not a vanilla one. celld's
 documented rule is: after restarting a node, wait until *every* node reports
@@ -231,7 +238,8 @@ them wrong via templates because there are no templates:
 - **Termination grace (40s) exceeds the drain bound** (`CELLD_SHUTDOWN_DRAIN_MS`,
   25s), so the kubelet never SIGKILLs a draining node.
 - **`CELLD_MAX_RSS_MB` is set explicitly** to ~80% of the container memory
-  limit; the upstream default is not cgroup-aware.
+  limit, so the ceiling is visible in the pod spec rather than inferred (celld
+  derives the same 80% from the cgroup limit on its own).
 - **The internal listener stays internal.** `:8081` (peer protocol plus an
   *unauthenticated* operator API) is reachable only from fleet pods and the
   operator's namespace via NetworkPolicy, reinforced by an Istio

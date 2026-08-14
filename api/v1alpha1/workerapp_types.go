@@ -93,8 +93,9 @@ type BucketSpec struct {
 }
 
 // ResourcesSpec sizes one fleet pod. The operator derives the container
-// limit, CELLD_MAX_RSS_MB (~80% of the limit, set explicitly — the upstream
-// default is not cgroup-aware), and admission caps from these two numbers.
+// limit, CELLD_MAX_RSS_MB (~80% of the limit, set explicitly so the ceiling
+// is visible in the pod spec; celld would derive the same value from the
+// cgroup limit itself), and admission caps from these two numbers.
 type ResourcesSpec struct {
 	// memoryGi is the container memory limit per pod, in GiB.
 	// +optional
@@ -150,9 +151,10 @@ type AutoscalingTargets struct {
 	// +kubebuilder:validation:Maximum=100
 	ResidentCellUtilization *int32 `json:"residentCellUtilization,omitempty"`
 
-	// p95LatencyMs adds a gateway-side latency target so traffic-bound,
-	// stateless-Worker-heavy apps scale even at low cell counts. Unset
-	// disables the latency signal.
+	// p95LatencyMs adds a latency target so traffic-bound,
+	// stateless-Worker-heavy apps scale even at low cell counts. The query
+	// reads Istio destination telemetry, so it needs Istio metrics in the
+	// same Prometheus. Unset disables the latency signal.
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	P95LatencyMs *int32 `json:"p95LatencyMs,omitempty"`
@@ -166,7 +168,7 @@ type AutoscalingSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// minReplicas is the scale floor; keep >= 2 for HA. Also the PDB floor.
+	// minReplicas is the scale floor; keep >= 2 for HA.
 	// +optional
 	// +kubebuilder:default=2
 	// +kubebuilder:validation:Minimum=1
@@ -231,8 +233,9 @@ func (t *TelemetrySpec) ResolvedSink() TelemetrySink {
 
 // WorkerAppSpec defines the desired state of WorkerApp.
 type WorkerAppSpec struct {
-	// hostnames route to this app on the shared Gateway; one HTTPRoute per
-	// hostname is reconciled in the app's namespace.
+	// hostnames route to this app. One route object is reconciled in the
+	// app's namespace carrying every hostname; what kind depends on the
+	// operator's --ingress-mode.
 	// +optional
 	// +listType=set
 	Hostnames []string `json:"hostnames,omitempty"`
@@ -271,8 +274,10 @@ type WorkerAppSpec struct {
 	// +optional
 	Vars *VarsSpec `json:"vars,omitempty"`
 
-	// websockets selects the WebSocket ingress profile: session affinity,
-	// long idle timeouts, and conservative scale-down (docs/celld-behaviors.md).
+	// websockets selects the WebSocket profile: long edge timeouts where the
+	// ingress mode can express them (httproute and ingress; not
+	// virtualservice) and a conservative scale-down window. No session
+	// affinity is configured.
 	// +optional
 	WebSockets bool `json:"websockets,omitempty"`
 
@@ -303,7 +308,8 @@ type RolloutStatus struct {
 	Partition int32 `json:"partition,omitempty"`
 
 	// waitingOn names the gate the rollout is blocked on, e.g.
-	// "celld-2: Ready" or "fleet: restoring=3". Empty when not waiting.
+	// "chat-celld-2: not ready" or "fleet: restoring=3". Empty when not
+	// waiting.
 	// +optional
 	WaitingOn string `json:"waitingOn,omitempty"`
 }
