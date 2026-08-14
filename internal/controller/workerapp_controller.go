@@ -21,11 +21,13 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -91,6 +93,7 @@ type WorkerAppReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
@@ -125,10 +128,16 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Edge, mesh, and autoscaling; each tolerates its CRD being absent so
 	// the operator runs on clusters without Gateway API, Istio, or KEDA and
-	// says so in conditions instead of failing the fleet.
-	r.ensureIngress(ctx, app, &conditions)
-	r.ensureAuthorizationPolicy(ctx, app, &conditions)
-	r.ensureScaledObject(ctx, app, outcome, &conditions)
+	// says so in conditions instead of failing the fleet. A transient
+	// failure (a conflict with another controller, an apiserver blip) is
+	// retried quickly — waiting out the steady-state requeue leaves a
+	// broken route or scaler in place for minutes.
+	transient := r.ensureIngress(ctx, app, &conditions)
+	transient = r.ensureAuthorizationPolicy(ctx, app, &conditions) || transient
+	transient = r.ensureScaledObject(ctx, app, outcome, &conditions) || transient
+	if transient && (outcome.Requeue == 0 || outcome.Requeue > 15*time.Second) {
+		outcome.Requeue = 15 * time.Second
+	}
 
 	// Status: live fleet numbers plus the rollout position.
 	if err := r.updateStatus(ctx, app, outcome, conditions); err != nil {
@@ -206,7 +215,10 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 
 // ensureObject creates the object or applies the desired mutation to the
 // live copy. The mutation copies only fields this operator owns, so server
-// defaulting and other controllers' fields survive.
+// defaulting and other controllers' fields survive. An update that would
+// change nothing is skipped — a fleet reconcile touches half a dozen
+// objects, and unconditional writes amplify every pod-churn burst into an
+// apiserver write storm.
 func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1alpha1.WorkerApp, desired client.Object, mutate func(live, desired client.Object)) error {
 	if err := ctrl.SetControllerReference(app, desired, r.Scheme); err != nil {
 		return err
@@ -219,25 +231,33 @@ func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1a
 	if err != nil {
 		return err
 	}
+	before := live.DeepCopyObject().(client.Object)
 	mutate(live, desired)
 	live.SetLabels(mergeStringMaps(live.GetLabels(), desired.GetLabels()))
+	if apiequality.Semantic.DeepEqual(before, live) {
+		return nil
+	}
 	return r.Update(ctx, live)
 }
 
-func (r *WorkerAppReconciler) ensureIngress(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
+// The ensure helpers return true when they hit a transient error worth a
+// fast requeue (anything but a missing CRD, which only changes when a
+// human installs something).
+func (r *WorkerAppReconciler) ensureIngress(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
 	if len(app.Spec.Hostnames) == 0 {
-		return
+		return false
 	}
 	switch r.IngressMode {
 	case IngressModeNone:
+		return false
 	case IngressModeVirtualService:
-		r.ensureVirtualService(ctx, app, conditions)
+		return r.ensureVirtualService(ctx, app, conditions)
 	default:
-		r.ensureHTTPRoute(ctx, app, conditions)
+		return r.ensureHTTPRoute(ctx, app, conditions)
 	}
 }
 
-func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
+func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
 	vs := buildVirtualService(app, r.IstioGateways)
 	err := r.ensureUnstructured(ctx, app, vs)
 	switch {
@@ -256,10 +276,12 @@ func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *pla
 			Type: condIngressReady, Status: metav1.ConditionFalse,
 			Reason: "RouteError", Message: err.Error(),
 		})
+		return true
 	}
+	return false
 }
 
-func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
+func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
 	route := buildHTTPRoute(app, r.GatewayName, r.GatewayNamespace)
 	err := r.ensureObject(ctx, app, route, func(live, desired client.Object) {
 		l, d := live.(*gatewayv1.HTTPRoute), desired.(*gatewayv1.HTTPRoute)
@@ -267,6 +289,17 @@ func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platform
 	})
 	switch {
 	case err == nil:
+		// Standard-channel Gateway API CRDs silently drop the experimental
+		// retry field; per the fail-loud rule, say so rather than let the
+		// drain-503 retry policy vanish quietly.
+		if dropped, checkErr := r.httpRouteRetryDropped(ctx, route); checkErr == nil && dropped {
+			*conditions = append(*conditions, metav1.Condition{
+				Type: condIngressReady, Status: metav1.ConditionTrue,
+				Reason:  "RouteReconciledRetryDropped",
+				Message: "cluster Gateway API CRDs dropped the retry field (standard channel); drain 503s are not retried at the gateway",
+			})
+			return false
+		}
 		*conditions = append(*conditions, metav1.Condition{
 			Type: condIngressReady, Status: metav1.ConditionTrue, Reason: "RouteReconciled",
 		})
@@ -281,10 +314,23 @@ func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platform
 			Type: condIngressReady, Status: metav1.ConditionFalse,
 			Reason: "RouteError", Message: err.Error(),
 		})
+		return true
 	}
+	return false
 }
 
-func (r *WorkerAppReconciler) ensureAuthorizationPolicy(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
+func (r *WorkerAppReconciler) httpRouteRetryDropped(ctx context.Context, desired *gatewayv1.HTTPRoute) (bool, error) {
+	if len(desired.Spec.Rules) == 0 || desired.Spec.Rules[0].Retry == nil {
+		return false, nil
+	}
+	var live gatewayv1.HTTPRoute
+	if err := r.Get(ctx, client.ObjectKeyFromObject(desired), &live); err != nil {
+		return false, err
+	}
+	return len(live.Spec.Rules) > 0 && live.Spec.Rules[0].Retry == nil, nil
+}
+
+func (r *WorkerAppReconciler) ensureAuthorizationPolicy(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
 	policy := buildAuthorizationPolicy(app, r.OperatorPrincipal)
 	err := r.ensureUnstructured(ctx, app, policy)
 	switch {
@@ -305,10 +351,12 @@ func (r *WorkerAppReconciler) ensureAuthorizationPolicy(ctx context.Context, app
 			Type: condMeshPolicyReady, Status: metav1.ConditionFalse,
 			Reason: "PolicyError", Message: err.Error(),
 		})
+		return true
 	}
+	return false
 }
 
-func (r *WorkerAppReconciler) ensureScaledObject(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, conditions *[]metav1.Condition) {
+func (r *WorkerAppReconciler) ensureScaledObject(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, conditions *[]metav1.Condition) bool {
 	if !autoscalingEnabled(app) {
 		// Best-effort cleanup if autoscaling was turned off.
 		obj := &unstructured.Unstructured{}
@@ -319,7 +367,7 @@ func (r *WorkerAppReconciler) ensureScaledObject(ctx context.Context, app *platf
 		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 			logf.FromContext(ctx).Error(err, "deleting stale ScaledObject")
 		}
-		return
+		return false
 	}
 	// Paused whenever the fleet is not steady, so KEDA and the rollout
 	// controller never fight over replica count (DESIGN.md §8).
@@ -342,7 +390,9 @@ func (r *WorkerAppReconciler) ensureScaledObject(ctx context.Context, app *platf
 			Type: condAutoscalingReady, Status: metav1.ConditionFalse,
 			Reason: "ScaledObjectError", Message: err.Error(),
 		})
+		return true
 	}
+	return false
 }
 
 func (r *WorkerAppReconciler) ensureUnstructured(ctx context.Context, app *platformv1alpha1.WorkerApp, desired *unstructured.Unstructured) error {

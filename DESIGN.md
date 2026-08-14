@@ -266,9 +266,10 @@ cert-manager. Route policy:
    the bump; v1: the deploy service does it). The template annotation changes,
    and the rollout controller takes over.
 
-Secrets and vars: Kubernetes Secret → `CELLD_VARS_FILE`; rotation is a Secret
-update + template-hash bump, i.e. an ordinary gated rollout. Never baked into
-bundles.
+Secrets and vars: Kubernetes Secret → `CELLD_VARS_FILE` (env-file format);
+the operator digests every referenced Secret into a pod-template annotation,
+so a rotation changes the template and rolls the fleet through the ordinary
+gated rollout. Never baked into bundles.
 
 A `wrangler deploy`-compatible API endpoint is deliberately deferred: celld's
 deploy path is intentionally not Cloudflare-API-shaped, and a platform CLI

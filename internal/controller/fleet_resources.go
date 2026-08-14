@@ -61,9 +61,18 @@ const (
 
 	watchDir = "/var/lib/celld"
 	varsDir  = "/etc/celld/vars"
-	// The vars Secret must carry its variables under this key; the file is
-	// handed to celld via CELLD_VARS_FILE.
-	varsKey = "vars.json"
+	// The vars Secret must carry its variables under this key. The file is
+	// handed to celld via CELLD_VARS_FILE and is env-file format —
+	// NAME=value lines, # comments, optional quotes (see celld's
+	// fleet.rs worker_vars) — not JSON.
+	varsKey = "vars.env"
+
+	// configHashAnnotation carries a digest of every Secret the pod
+	// template references (vars, bucket credentials). Rotating a Secret
+	// changes the digest, which changes the template, which triggers the
+	// ordinary gated rollout — without it, rotation silently did nothing
+	// until some unrelated rollout happened to restart the fleet.
+	configHashAnnotation = "platform.ezghcloud.com/config-hash"
 )
 
 func fleetName(app *platformv1alpha1.WorkerApp) string {
@@ -109,8 +118,9 @@ func maxResidentCells(app *platformv1alpha1.WorkerApp) int32 {
 
 // buildPodTemplate is the single source of truth for a fleet pod. The
 // rollout controller compares its hash against the live StatefulSet to
-// decide whether a gated rollout is needed (DESIGN.md §8).
-func buildPodTemplate(app *platformv1alpha1.WorkerApp) corev1.PodTemplateSpec {
+// decide whether a gated rollout is needed (DESIGN.md §8). configHash
+// digests the referenced Secrets so rotation rolls the fleet.
+func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash string) corev1.PodTemplateSpec {
 	memGi := memoryGi(app)
 	// Explicit RSS threshold ≈80% of the container limit: the upstream
 	// default derives from "available memory" and is not cgroup-aware (F10).
@@ -220,15 +230,20 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp) corev1.PodTemplateSpec {
 		VolumeMounts: mounts,
 	}
 
+	annotations := map[string]string{
+		// The declarative rollout trigger (F4): `celld deploy`
+		// publishes to the bucket, then this annotation bump rolls
+		// the fleet so nodes restart into the new deployment.
+		appVersionAnnotation: app.Spec.AppVersion,
+	}
+	if configHash != "" {
+		annotations[configHashAnnotation] = configHash
+	}
+
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels: fleetLabels(app),
-			Annotations: map[string]string{
-				// The declarative rollout trigger (F4): `celld deploy`
-				// publishes to the bucket, then this annotation bump rolls
-				// the fleet so nodes restart into the new deployment.
-				appVersionAnnotation: app.Spec.AppVersion,
-			},
+			Labels:      fleetLabels(app),
+			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName:            fleetName(app),
@@ -253,8 +268,8 @@ func templateHash(t corev1.PodTemplateSpec) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func buildStatefulSet(app *platformv1alpha1.WorkerApp) *appsv1.StatefulSet {
-	template := buildPodTemplate(app)
+func buildStatefulSet(app *platformv1alpha1.WorkerApp, configHash string) *appsv1.StatefulSet {
+	template := buildPodTemplate(app, configHash)
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fleetName(app),

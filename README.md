@@ -113,7 +113,7 @@ spec:
     memoryGi: 8                          # ~1000 resident cells per 8 GiB
     maxResidentCells: 1000
   vars:
-    secretRef: chat-vars                 # Secret with key "vars.json" -> CELLD_VARS_FILE
+    secretRef: chat-vars                 # Secret with key "vars.env" (NAME=value lines) -> CELLD_VARS_FILE
   websockets: true                       # long idle timeouts, sticky-friendly, slow scale-down
   autoscaling:
     enabled: true

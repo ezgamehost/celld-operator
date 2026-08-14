@@ -18,7 +18,11 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -127,15 +131,61 @@ func autoscalingEnabled(app *platformv1alpha1.WorkerApp) bool {
 	return app.Spec.Autoscaling != nil && app.Spec.Autoscaling.Enabled
 }
 
+// configHash digests every Secret the pod template references, so a
+// rotation changes the template and triggers a gated rollout. A missing
+// Secret hashes as a distinct marker: its later creation also rolls the
+// fleet. Secrets are read uncached (see main.go) — no cluster-wide Secret
+// informer — so a rotation lands on the next reconcile rather than
+// instantly; the steady-state requeue bounds that latency.
+func (r *WorkerAppReconciler) configHash(ctx context.Context, app *platformv1alpha1.WorkerApp) (string, error) {
+	var refs []string
+	if app.Spec.Vars != nil && app.Spec.Vars.SecretRef != "" {
+		refs = append(refs, app.Spec.Vars.SecretRef)
+	}
+	if ref := app.Spec.Bucket.CredentialsFrom.SecretRef; ref != "" {
+		refs = append(refs, ref)
+	}
+	if len(refs) == 0 {
+		return "", nil
+	}
+	digest := sha256.New()
+	write := func(parts ...[]byte) {
+		for _, p := range parts {
+			_, _ = digest.Write(p)
+			_, _ = digest.Write([]byte{0})
+		}
+	}
+	for _, name := range refs {
+		var secret corev1.Secret
+		err := r.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: name}, &secret)
+		if apierrors.IsNotFound(err) {
+			write([]byte("missing"), []byte(name))
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("reading secret %s: %w", name, err)
+		}
+		write([]byte("secret"), []byte(name))
+		for _, k := range slices.Sorted(maps.Keys(secret.Data)) {
+			write([]byte(k), secret.Data[k])
+		}
+	}
+	return hex.EncodeToString(digest.Sum(nil))[:16], nil
+}
+
 // reconcileFleet drives the StatefulSet toward spec and returns the phase.
 func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv1alpha1.WorkerApp) (fleetOutcome, error) {
-	desired := buildStatefulSet(app)
+	configHash, err := r.configHash(ctx, app)
+	if err != nil {
+		return fleetOutcome{}, err
+	}
+	desired := buildStatefulSet(app, configHash)
 	if err := ctrl.SetControllerReference(app, desired, r.Scheme); err != nil {
 		return fleetOutcome{}, err
 	}
 
 	var existing appsv1.StatefulSet
-	err := r.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: fleetName(app)}, &existing)
+	err = r.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: fleetName(app)}, &existing)
 	if apierrors.IsNotFound(err) {
 		// Fresh fleet: no gating — pods come up ordered, and there is
 		// nothing warm to protect yet.
