@@ -2,7 +2,8 @@
 
 Thanks for considering a contribution. This project is an alpha operator for
 an alpha runtime; the bar for changes is that they keep the operational
-invariants documented in [DESIGN.md](DESIGN.md) intact.
+invariants documented in [docs/celld-behaviors.md](docs/celld-behaviors.md)
+intact.
 
 ## Development
 
@@ -27,8 +28,9 @@ every push.
 - Anything that touches the rollout state machine, the fencing-adjacent
   paths (partition stepping, `/state` gating), or the guardrails in
   `fleet_resources.go` should cite the celld behavior it depends on, the
-  way the existing code comments do (DESIGN.md's F1–F11 table is the
-  index). If upstream celld changed, update the table.
+  way the existing code comments do (the F1–F11 table in
+  [docs/celld-behaviors.md](docs/celld-behaviors.md) is the index). If
+  upstream celld changed, update the table.
 - The `breakingBoundaries` table in `internal/controller/rollout.go` must
   track celld release notes: if upstream flags a version pair as not
   rolling-safe, add it in the same PR that bumps supported versions.

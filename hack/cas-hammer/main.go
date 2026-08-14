@@ -16,7 +16,7 @@ limitations under the License.
 
 // cas-hammer probes an S3-compatible object store for the property celld's
 // fencing depends on and a sequential test cannot prove: that conditional
-// PUTs are enforced ATOMICALLY under concurrent racers (DESIGN.md §9).
+// PUTs are enforced ATOMICALLY under concurrent racers (docs/celld-behaviors.md).
 //
 // celld's own contract test (put_cas_contract in crates/celld/bucket.rs)
 // verifies the four sequential transitions — create / reject-create /

@@ -38,7 +38,7 @@ import (
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
 )
 
-// The rollout controller (DESIGN.md §8). Vanilla StatefulSet RollingUpdate
+// The rollout controller (docs/celld-behaviors.md). Vanilla StatefulSet RollingUpdate
 // gates each step on the NEW pod's readiness, but celld's documented gate is
 // fleet-wide restoring=0 — and the restore work lands on the PEERS that
 // absorbed the drained node's cells, not on the replacement pod. So the
@@ -46,8 +46,8 @@ import (
 // only when the whole fleet has re-warmed.
 
 // breakingBoundaries lists celld upgrades that upstream forbids as rolling
-// (mixed fleets break). Maintained from celld release notes; DESIGN.md §13
-// open question 1 tracks automating this. Entries are "major.minor" pairs.
+// (mixed fleets break). Maintained from celld release notes
+// (docs/celld-behaviors.md, F8). Entries are "major.minor" pairs.
 var breakingBoundaries = [][2]string{
 	// v0.1 -> v0.2: ownership records changed address semantics and block
 	// objects changed format; upstream requires stop-all-then-start.
@@ -295,7 +295,7 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 
 // rolloutStep advances a gated rolling update by at most one ordinal.
 // Reconciles arrive at least Requeue apart, so steps are naturally paced —
-// the damper DESIGN.md §8 calls settle time.
+// the damper docs/celld-behaviors.md calls settle time.
 func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1alpha1.WorkerApp, sts *appsv1.StatefulSet) (fleetOutcome, error) {
 	partition := stsPartition(sts)
 	liveReplicas := ptr.Deref(sts.Spec.Replicas, 0)

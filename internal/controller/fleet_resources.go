@@ -36,7 +36,7 @@ import (
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
 )
 
-// Builders for everything one WorkerApp fleet reconciles to (DESIGN.md §6).
+// Builders for everything one WorkerApp fleet reconciles to (docs/celld-behaviors.md).
 // Naming: every child object is "<app>-celld"; the headless peer service is
 // "<app>-celld-internal". Pods carry the workerapp label, which is the
 // selector for the StatefulSet, both Services, the PDB, the NetworkPolicy,
@@ -61,7 +61,7 @@ const (
 	internalPort = 8081
 
 	// celld's default drain bound; terminationGracePeriodSeconds must exceed
-	// it so the orchestrator never SIGKILLs a draining node (DESIGN.md F6).
+	// it so the orchestrator never SIGKILLs a draining node (docs/celld-behaviors.md F6).
 	shutdownDrainMs   = 25000
 	terminationGraceS = 40
 
@@ -124,7 +124,7 @@ func maxResidentCells(app *platformv1alpha1.WorkerApp) int32 {
 
 // buildPodTemplate is the single source of truth for a fleet pod. The
 // rollout controller compares its hash against the live StatefulSet to
-// decide whether a gated rollout is needed (DESIGN.md §8). configHash
+// decide whether a gated rollout is needed (docs/celld-behaviors.md). configHash
 // digests the referenced Secrets so rotation rolls the fleet; appVersion
 // is the resolved deployment version (pinned or bucket-tracked).
 func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion string) corev1.PodTemplateSpec {
@@ -227,7 +227,7 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		},
 		// Liveness must NOT use the health path: it goes 503 during a
 		// graceful drain, and an HTTP liveness probe there kills the node
-		// mid-handoff (DESIGN.md §6). TCP only.
+		// mid-handoff (docs/celld-behaviors.md). TCP only.
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{
 				Port: intstr.FromInt32(publicPort),
@@ -364,9 +364,9 @@ func buildServiceAccount(app *platformv1alpha1.WorkerApp) *corev1.ServiceAccount
 		},
 	}
 	// IRSA: the bucket credential is fleet-admin authority, so it arrives
-	// through the pod identity, scoped to this fleet's prefix (DESIGN.md §4).
+	// through the pod identity, scoped to this fleet's prefix (docs/celld-behaviors.md).
 	// GKE Workload Identity wiring is a v1 item; "auto" provisioning is
-	// DESIGN.md §13 open question 2 and is surfaced as a condition.
+	// docs/celld-behaviors.md "known not-implemented" and is surfaced as a condition.
 	if role := app.Spec.Bucket.CredentialsFrom.IAMRole; role != "" && role != iamRoleAuto {
 		sa.Annotations = map[string]string{"eks.amazonaws.com/role-arn": role}
 	}
@@ -429,7 +429,7 @@ func buildPDB(app *platformv1alpha1.WorkerApp) *policyv1.PodDisruptionBudget {
 }
 
 // buildHTTPRoute binds the app's hostnames to the public Service on the
-// shared Gateway. Route policy per DESIGN.md §6: retry the drain 503s so
+// shared Gateway. Route policy per docs/celld-behaviors.md: retry the drain 503s so
 // rollouts are invisible to clients, and disable the request timeout for
 // WebSocket apps so quiet hibernated sockets are not severed.
 func buildHTTPRoute(app *platformv1alpha1.WorkerApp, gatewayName, gatewayNamespace string) *gatewayv1.HTTPRoute {
@@ -604,7 +604,7 @@ func buildVirtualService(app *platformv1alpha1.WorkerApp, gateways []string) *un
 
 // buildAuthorizationPolicy adds identity-based enforcement in front of the
 // unauthenticated operator API when Istio is present: only the fleet's own
-// service account and the operator may speak to :8081 (DESIGN.md §7).
+// service account and the operator may speak to :8081 (docs/celld-behaviors.md).
 // Unstructured so the operator does not depend on Istio being installed.
 func buildAuthorizationPolicy(app *platformv1alpha1.WorkerApp, operatorPrincipal string) *unstructured.Unstructured {
 	fleetPrincipal := fmt.Sprintf("cluster.local/ns/%s/sa/%s", app.Namespace, fleetName(app))
@@ -635,7 +635,7 @@ func buildAuthorizationPolicy(app *platformv1alpha1.WorkerApp, operatorPrincipal
 }
 
 // buildScaledObject materializes spec.autoscaling as a KEDA ScaledObject
-// over the operator's /state-derived metrics (DESIGN.md §8, Autoscaling).
+// over the operator's /state-derived metrics (docs/celld-behaviors.md, Autoscaling).
 // paused pins replicas during rollouts so the scaler and the partition
 // controller never fight.
 func buildScaledObject(app *platformv1alpha1.WorkerApp, prometheusURL string, paused bool) *unstructured.Unstructured {
@@ -674,7 +674,7 @@ func buildScaledObject(app *platformv1alpha1.WorkerApp, prometheusURL string, pa
 
 	// Scale down slowly and one pod at a time: removing a pod hands off its
 	// cells (cold restores on peers) and closes its WebSockets; WebSocket
-	// fleets wait even longer (DESIGN.md §8).
+	// fleets wait even longer (docs/celld-behaviors.md).
 	stabilizationS := 600
 	if app.Spec.WebSockets {
 		stabilizationS = 1800

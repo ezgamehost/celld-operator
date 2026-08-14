@@ -32,9 +32,9 @@ import (
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
 )
 
-// celld ships no metrics endpoint (DESIGN.md F9). The operator polls each
+// celld ships no metrics endpoint (docs/celld-behaviors.md F9). The operator polls each
 // fleet pod's internal /state — it is the one authorized cross-namespace
-// caller (§7) — and re-exports what it sees as Prometheus metrics. The same
+// caller — and re-exports what it sees as Prometheus metrics. The same
 // series drive KEDA autoscaling, dashboards, and alerting; the rollout
 // controller does its own live sweep at gate time rather than trusting this
 // cache.
@@ -83,8 +83,8 @@ func init() {
 
 // PodState is one pod's /state sample. The response schema is celld's alpha
 // operator API (main.rs state_json): keep parsing tolerant, fail per-pod
-// not per-fleet, and pin operator and celld releases together (DESIGN.md
-// §11).
+// not per-fleet, and pin operator and celld releases together
+// (docs/celld-behaviors.md).
 type PodState struct {
 	Occupied int64 `json:"occupied"`
 	Evicting int64 `json:"evicting"`

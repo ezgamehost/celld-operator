@@ -53,7 +53,7 @@ const (
 )
 
 // Ingress modes (--ingress-mode). HTTPRoute is the Gateway API path from
-// DESIGN.md §6; VirtualService targets clusters whose ingress is an
+// docs/celld-behaviors.md; VirtualService targets clusters whose ingress is an
 // existing classic istio-ingressgateway (Gateway API CRDs on the standard
 // channel drop the retry field, and older Istio releases do not attach
 // Gateway API Gateways to pre-existing deployments).
@@ -70,7 +70,7 @@ const (
 // WorkerAppReconciler reconciles one celld fleet per WorkerApp: the
 // StatefulSet and its rollout, both Services, the network and mesh policy
 // around the unauthenticated internal listener, the PDB, the HTTPRoute on
-// the shared Gateway, and the KEDA ScaledObject (DESIGN.md §6, §8).
+// the shared Gateway, and the KEDA ScaledObject (docs/celld-behaviors.md).
 type WorkerAppReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -191,7 +191,7 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 		return fmt.Errorf("service account: %w", err)
 	}
 	if app.Spec.Bucket.CredentialsFrom.IAMRole == iamRoleAuto {
-		// DESIGN.md §13 open question 2: automatic IAM provisioning is not
+		// docs/celld-behaviors.md "known not-implemented": automatic IAM provisioning is not
 		// built yet. The fleet still runs; credentials must arrive by
 		// annotating the fleet ServiceAccount (or via secretRef).
 		*conditions = append(*conditions, metav1.Condition{
@@ -398,7 +398,7 @@ func (r *WorkerAppReconciler) ensureAuthorizationPolicy(ctx context.Context, app
 		})
 	case meta.IsNoMatchError(err):
 		// No Istio: NetworkPolicy still guards :8081; the mesh layer is
-		// defense in depth, not a requirement (DESIGN.md §7).
+		// defense in depth, not a requirement (docs/celld-behaviors.md).
 		*conditions = append(*conditions, metav1.Condition{
 			Type: condMeshPolicyReady, Status: metav1.ConditionFalse,
 			Reason:  "IstioUnavailable",
@@ -428,7 +428,7 @@ func (r *WorkerAppReconciler) ensureScaledObject(ctx context.Context, app *platf
 		return false
 	}
 	// Paused whenever the fleet is not steady, so KEDA and the rollout
-	// controller never fight over replica count (DESIGN.md §8).
+	// controller never fight over replica count (docs/celld-behaviors.md).
 	paused := outcome.Phase != platformv1alpha1.PhaseReady
 	scaled := buildScaledObject(app, r.PrometheusURL, paused)
 	err := r.ensureUnstructured(ctx, app, scaled)

@@ -30,5 +30,6 @@ exposure:
   AuthorizationPolicy; weakening either is equivalent to granting cell
   eviction and shutdown rights to whatever can reach the pod network.
 - celld itself is not safe for hostile multi-tenant use; the isolation
-  model is fleet-per-application. See DESIGN.md §4 before hosting
+  model is fleet-per-application. See
+  [docs/celld-behaviors.md](docs/celld-behaviors.md) (F3) before hosting
   untrusted code.

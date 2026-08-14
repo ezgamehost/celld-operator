@@ -22,12 +22,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// The WorkerApp API follows DESIGN.md §6: one WorkerApp is one celld fleet
+// The WorkerApp API follows docs/celld-behaviors.md: one WorkerApp is one celld fleet
 // serving one application deployment (celld runs one app per fleet, so the
 // CR, the fleet, and the app are 1:1:1).
 
 // UpdateStrategy selects how a celld version change rolls through the fleet.
-// Rolling is the partition-stepped, restoring-gated path (DESIGN.md §8);
+// Rolling is the partition-stepped, restoring-gated path (docs/celld-behaviors.md);
 // Recreate scales to zero first, for upstream releases that forbid mixed
 // fleets. A Rolling request across a known-breaking celld boundary is refused.
 // +kubebuilder:validation:Enum=Rolling;Recreate
@@ -73,7 +73,7 @@ type BucketSpec struct {
 	// name is the fleet bucket and prefix, e.g. "s3://platform-cells/apps/chat"
 	// or "gs://platform-cells/apps/chat". The store must satisfy celld's
 	// fencing contract (conditional create/overwrite, read-after-write);
-	// see DESIGN.md §9 for the qualified list.
+	// see docs/celld-behaviors.md for the qualified list.
 	// +required
 	// +kubebuilder:validation:Pattern=`^(s3|gs)://.+`
 	Name string `json:"name"`
@@ -138,7 +138,7 @@ type ServiceSpec struct {
 	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
-// AutoscalingTargets are the scale signals (DESIGN.md §8, Autoscaling).
+// AutoscalingTargets are the scale signals (docs/celld-behaviors.md, Autoscaling).
 type AutoscalingTargets struct {
 	// residentCellUtilization is the target fleet-average percentage of
 	// occupied resident cells vs maxResidentCells. Kept conservative by
@@ -239,7 +239,7 @@ type WorkerAppSpec struct {
 
 	// appVersion names the application deployment in the fleet bucket
 	// (written there by `celld deploy`). Nodes load a deployment at startup
-	// only, so changing this triggers the gated rollout (DESIGN.md §8).
+	// only, so changing this triggers the gated rollout (docs/celld-behaviors.md).
 	// The sentinel "auto" makes the operator follow the bucket's
 	// deploy/current.json instead: `celld deploy` alone rolls the fleet,
 	// within one poll interval, with no CR edit.
@@ -272,7 +272,7 @@ type WorkerAppSpec struct {
 	Vars *VarsSpec `json:"vars,omitempty"`
 
 	// websockets selects the WebSocket ingress profile: session affinity,
-	// long idle timeouts, and conservative scale-down (DESIGN.md §6, §8).
+	// long idle timeouts, and conservative scale-down (docs/celld-behaviors.md).
 	// +optional
 	WebSockets bool `json:"websockets,omitempty"`
 
@@ -295,7 +295,7 @@ const (
 	PhaseDegraded   WorkerAppPhase = "Degraded"
 )
 
-// RolloutStatus reports the partition-stepped rollout (DESIGN.md §8).
+// RolloutStatus reports the partition-stepped rollout (docs/celld-behaviors.md).
 type RolloutStatus struct {
 	// partition is the current StatefulSet rolling-update partition owned
 	// by the rollout controller. 0 means no rollout in progress.

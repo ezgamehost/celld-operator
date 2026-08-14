@@ -11,8 +11,9 @@ provisions and operates a complete celld fleet: workload, networking, security
 policy, ingress, gated rollouts, metrics, and autoscaling.
 
 > **Status: alpha.** celld itself is an alpha and this operator tracks it
-> release-for-release. The architecture and every design decision are recorded
-> in [DESIGN.md](DESIGN.md); this README is the operational guide.
+> release-for-release. The celld behaviors the operator encodes are indexed
+> in [docs/celld-behaviors.md](docs/celld-behaviors.md); this README is the
+> operational guide.
 
 ## How it works
 
@@ -41,7 +42,7 @@ Each application is its own fleet with its own bucket prefix and its own
 credentials — tenancy lives at the Kubernetes layer. Even a full runtime
 compromise inside one fleet reaches only that app's pods and that app's
 prefix. This is a platform for *your* applications (or your customers' apps
-under your operation), not for anonymous hostile code; see DESIGN.md §4.
+under your operation), not for anonymous hostile code.
 
 ## Prerequisites
 
@@ -312,7 +313,8 @@ make run      # run against the current kubeconfig
 Layout: `api/v1alpha1` (the `WorkerApp` types), `internal/controller`
 (`fleet_resources.go` builders, `rollout.go` the gated rollout state machine,
 `fleetstate.go` the `/state` poller and metrics), `hack/cas-hammer`, and
-[DESIGN.md](DESIGN.md) for why everything is the way it is.
+[docs/celld-behaviors.md](docs/celld-behaviors.md) for the celld behaviors
+each guardrail encodes.
 
 ## License
 

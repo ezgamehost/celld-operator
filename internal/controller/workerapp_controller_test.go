@@ -127,7 +127,7 @@ var _ = Describe("WorkerApp Controller", func() {
 			container := sts.Spec.Template.Spec.Containers[0]
 			Expect(container.Image).To(Equal(testCelldImage))
 			// Liveness must never be an HTTP probe on the health path: it
-			// answers 503 during a graceful drain (DESIGN.md §6).
+			// answers 503 during a graceful drain (docs/celld-behaviors.md).
 			Expect(container.LivenessProbe.HTTPGet).To(BeNil())
 			Expect(container.LivenessProbe.TCPSocket).NotTo(BeNil())
 			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/__celld/health"))
