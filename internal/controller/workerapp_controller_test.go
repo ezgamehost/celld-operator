@@ -21,13 +21,22 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
+)
+
+const (
+	testCelldImage    = "ghcr.io/denoland/celld:v0.2.0"
+	testCelldImageOld = "ghcr.io/denoland/celld:v0.1.0"
 )
 
 var _ = Describe("WorkerApp Controller", func() {
@@ -43,7 +52,24 @@ var _ = Describe("WorkerApp Controller", func() {
 			Name:      resourceName,
 			Namespace: resourceNamespace,
 		}
+		fleetKey := types.NamespacedName{
+			Name:      resourceName + "-celld",
+			Namespace: resourceNamespace,
+		}
 		workerapp := &platformv1alpha1.WorkerApp{}
+
+		reconciler := func() *WorkerAppReconciler {
+			return &WorkerAppReconciler{
+				Client:            k8sClient,
+				Scheme:            k8sClient.Scheme(),
+				State:             NewStateClient(),
+				GatewayName:       "edge",
+				GatewayNamespace:  "infra",
+				PrometheusURL:     "http://prometheus.test:9090",
+				OperatorNamespace: "celld-operator-system",
+				OperatorPrincipal: "cluster.local/ns/celld-operator-system/sa/celld-operator",
+			}
+		}
 
 		BeforeEach(func() {
 			By("creating the custom resource for the Kind WorkerApp")
@@ -59,7 +85,7 @@ var _ = Describe("WorkerApp Controller", func() {
 					Spec: platformv1alpha1.WorkerAppSpec{
 						AppVersion: "sha-test",
 						Celld: platformv1alpha1.CelldSpec{
-							Image: "ghcr.io/denoland/celld:v0.2.0",
+							Image: testCelldImage,
 						},
 						Bucket: platformv1alpha1.BucketSpec{
 							Name: "s3://test-cells/apps/test",
@@ -71,27 +97,104 @@ var _ = Describe("WorkerApp Controller", func() {
 		})
 
 		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
 			resource := &platformv1alpha1.WorkerApp{}
 			err := k8sClient.Get(ctx, typeNamespacedName, resource)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Cleanup the specific resource instance WorkerApp")
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &WorkerAppReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+			// envtest has no garbage collector; remove the owned fleet so
+			// the next spec starts clean.
+			sts := &appsv1.StatefulSet{}
+			if err := k8sClient.Get(ctx, fleetKey, sts); err == nil {
+				Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
 			}
+		})
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
+		It("should reconcile the full fleet", func() {
+			By("Reconciling twice: create pass, then steady pass")
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("creating the StatefulSet with the celld guardrails")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			container := sts.Spec.Template.Spec.Containers[0]
+			Expect(container.Image).To(Equal(testCelldImage))
+			// Liveness must never be an HTTP probe on the health path: it
+			// answers 503 during a graceful drain (DESIGN.md §6).
+			Expect(container.LivenessProbe.HTTPGet).To(BeNil())
+			Expect(container.LivenessProbe.TCPSocket).NotTo(BeNil())
+			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/__celld/health"))
+			Expect(*sts.Spec.Template.Spec.TerminationGracePeriodSeconds).
+				To(BeNumerically(">", int64(shutdownDrainMs/1000)))
+			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(appVersionAnnotation, "sha-test"))
+			env := map[string]string{}
+			for _, e := range container.Env {
+				env[e.Name] = e.Value
+			}
+			Expect(env).To(HaveKeyWithValue("CELLD_BUCKET", "s3://test-cells/apps/test"))
+			// Explicit RSS bound ≈80% of the 8Gi default limit.
+			Expect(env).To(HaveKeyWithValue("CELLD_MAX_RSS_MB", "6553"))
+			Expect(env["CELLD_ADVERTISE"]).To(ContainSubstring("test-resource-celld-internal"))
+
+			By("creating both Services, the NetworkPolicy, and the PDB")
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, fleetKey, svc)).To(Succeed())
+			headless := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: resourceName + "-celld-internal", Namespace: resourceNamespace,
+			}, headless)).To(Succeed())
+			Expect(headless.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
+			// Peers must reach draining pods to take over cells.
+			Expect(headless.Spec.PublishNotReadyAddresses).To(BeTrue())
+			netpol := &networkingv1.NetworkPolicy{}
+			Expect(k8sClient.Get(ctx, fleetKey, netpol)).To(Succeed())
+			pdb := &policyv1.PodDisruptionBudget{}
+			Expect(k8sClient.Get(ctx, fleetKey, pdb)).To(Succeed())
+
+			By("reporting status: converging, credentials configured, Istio absent tolerated")
+			updated := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhasePending))
+			Expect(meta.IsStatusConditionTrue(updated.Status.Conditions, condBucketCredentialsReady)).To(BeTrue())
+			mesh := meta.FindStatusCondition(updated.Status.Conditions, condMeshPolicyReady)
+			Expect(mesh).NotTo(BeNil())
+			Expect(mesh.Reason).To(Equal("IstioUnavailable"))
+		})
+
+		It("should refuse a rolling update across a breaking celld boundary", func() {
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("bumping the celld image across the v0.1 -> v0.2 boundary shape")
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			// Seed the live StatefulSet with a v0.1 image so the transition
+			// to the spec's v0.2 image crosses the flagged boundary.
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			sts.Spec.Template.Spec.Containers[0].Image = testCelldImageOld
+			// Stale the hash too: rollout detection compares the template
+			// hash annotation, and the seeded template must read as old.
+			sts.Annotations[templateHashAnnotation] = "stale-v0.1-template"
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
+
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseDegraded))
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("not rolling-safe"))
+
+			By("confirming the fleet was not touched")
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImageOld))
 		})
 	})
 })

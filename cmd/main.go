@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
 	"github.com/ezgamehost/celld-operator/internal/controller"
@@ -49,6 +51,9 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
+	// Gateway API types for HTTPRoute reconciliation. Registering the scheme
+	// is safe when the CRDs are absent; the reconciler tolerates NoMatch.
+	utilruntime.Must(gatewayv1.Install(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -79,6 +84,21 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	var gatewayName, gatewayNamespace, prometheusURL, operatorNamespace, operatorPrincipal string
+	var statePollInterval time.Duration
+	flag.StringVar(&gatewayName, "gateway-name", "edge",
+		"Name of the shared Gateway that WorkerApp HTTPRoutes attach to.")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "infra",
+		"Namespace of the shared Gateway.")
+	flag.StringVar(&prometheusURL, "prometheus-url", "http://prometheus-operated.monitoring.svc:9090",
+		"Prometheus base URL KEDA queries for the operator's celld_* metrics.")
+	flag.StringVar(&operatorNamespace, "operator-namespace", "celld-operator-system",
+		"Namespace the operator runs in; fleet NetworkPolicies allow it to reach the internal listener.")
+	flag.StringVar(&operatorPrincipal, "operator-principal",
+		"cluster.local/ns/celld-operator-system/sa/celld-operator-controller-manager",
+		"Istio principal of the operator, allowed by fleet AuthorizationPolicies on the internal port.")
+	flag.DurationVar(&statePollInterval, "state-poll-interval", 15*time.Second,
+		"How often fleet pods' /state endpoints are polled for metrics export.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -178,11 +198,28 @@ func main() {
 		os.Exit(1)
 	}
 
+	stateClient := controller.NewStateClient()
 	if err := (&controller.WorkerAppReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		State:             stateClient,
+		GatewayName:       gatewayName,
+		GatewayNamespace:  gatewayNamespace,
+		PrometheusURL:     prometheusURL,
+		OperatorNamespace: operatorNamespace,
+		OperatorPrincipal: operatorPrincipal,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "workerapp")
+		os.Exit(1)
+	}
+	// Continuous /state polling: celld has no metrics endpoint, so the
+	// operator exports the fleet's capacity signals for KEDA and dashboards.
+	if err := mgr.Add(&controller.StatePoller{
+		Client:   mgr.GetClient(),
+		State:    stateClient,
+		Interval: statePollInterval,
+	}); err != nil {
+		setupLog.Error(err, "Failed to add fleet state poller")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

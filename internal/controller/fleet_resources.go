@@ -1,0 +1,584 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
+)
+
+// Builders for everything one WorkerApp fleet reconciles to (DESIGN.md §6).
+// Naming: every child object is "<app>-celld"; the headless peer service is
+// "<app>-celld-internal". Pods carry the workerapp label, which is the
+// selector for the StatefulSet, both Services, the PDB, the NetworkPolicy,
+// and the Istio AuthorizationPolicy.
+
+const (
+	celldContainerName = "celld"
+
+	workerAppLabel = "platform.ezghcloud.com/workerapp"
+
+	appVersionAnnotation   = "platform.ezghcloud.com/app-version"
+	templateHashAnnotation = "platform.ezghcloud.com/template-hash"
+	kedaPausedAnnotation   = "autoscaling.keda.sh/paused"
+
+	publicPort   = 8080
+	internalPort = 8081
+
+	// celld's default drain bound; terminationGracePeriodSeconds must exceed
+	// it so the orchestrator never SIGKILLs a draining node (DESIGN.md F6).
+	shutdownDrainMs   = 25000
+	terminationGraceS = 40
+
+	watchDir = "/var/lib/celld"
+	varsDir  = "/etc/celld/vars"
+	// The vars Secret must carry its variables under this key; the file is
+	// handed to celld via CELLD_VARS_FILE.
+	varsKey = "vars.json"
+)
+
+func fleetName(app *platformv1alpha1.WorkerApp) string {
+	return app.Name + "-celld"
+}
+
+func internalServiceName(app *platformv1alpha1.WorkerApp) string {
+	return app.Name + "-celld-internal"
+}
+
+func fleetLabels(app *platformv1alpha1.WorkerApp) map[string]string {
+	return map[string]string{
+		workerAppLabel:               app.Name,
+		"app.kubernetes.io/name":     celldContainerName,
+		"app.kubernetes.io/instance": app.Name,
+	}
+}
+
+func selectorLabels(app *platformv1alpha1.WorkerApp) map[string]string {
+	return map[string]string{workerAppLabel: app.Name}
+}
+
+func desiredReplicas(app *platformv1alpha1.WorkerApp) int32 {
+	if app.Spec.Replicas != nil {
+		return *app.Spec.Replicas
+	}
+	return 3
+}
+
+func memoryGi(app *platformv1alpha1.WorkerApp) int32 {
+	if app.Spec.Resources.MemoryGi > 0 {
+		return app.Spec.Resources.MemoryGi
+	}
+	return 8
+}
+
+func maxResidentCells(app *platformv1alpha1.WorkerApp) int32 {
+	if app.Spec.Resources.MaxResidentCells > 0 {
+		return app.Spec.Resources.MaxResidentCells
+	}
+	return 1000
+}
+
+// buildPodTemplate is the single source of truth for a fleet pod. The
+// rollout controller compares its hash against the live StatefulSet to
+// decide whether a gated rollout is needed (DESIGN.md §8).
+func buildPodTemplate(app *platformv1alpha1.WorkerApp) corev1.PodTemplateSpec {
+	memGi := memoryGi(app)
+	// Explicit RSS threshold ≈80% of the container limit: the upstream
+	// default derives from "available memory" and is not cgroup-aware (F10).
+	rssMb := memGi * 1024 * 4 / 5
+
+	env := []corev1.EnvVar{
+		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+		}},
+		{Name: "CELLD_BUCKET", Value: app.Spec.Bucket.Name},
+		{Name: "CELLD_INTERNAL_ADDR", Value: fmt.Sprintf("0.0.0.0:%d", internalPort)},
+		// Stable per-pod DNS via the headless service; peers resolve it to
+		// the internal listener (F2).
+		{Name: "CELLD_ADVERTISE", Value: fmt.Sprintf(
+			"$(POD_NAME).%s.%s.svc.cluster.local:%d",
+			internalServiceName(app), app.Namespace, internalPort)},
+		{Name: "CELLD_WATCH", Value: watchDir},
+		{Name: "CELLD_SHUTDOWN_DRAIN_MS", Value: fmt.Sprintf("%d", shutdownDrainMs)},
+		{Name: "CELLD_MAX_RESIDENT_CELLS", Value: fmt.Sprintf("%d", maxResidentCells(app))},
+		{Name: "CELLD_MAX_RSS_MB", Value: fmt.Sprintf("%d", rssMb)},
+	}
+	if app.Spec.Bucket.Endpoint != "" {
+		env = append(env, corev1.EnvVar{Name: "S3_ENDPOINT", Value: app.Spec.Bucket.Endpoint})
+	}
+	if app.Spec.Bucket.Region != "" {
+		env = append(env, corev1.EnvVar{Name: "AWS_REGION", Value: app.Spec.Bucket.Region})
+	}
+	telemetryOn := app.Spec.Telemetry.Enabled == nil || *app.Spec.Telemetry.Enabled
+	if telemetryOn {
+		env = append(env, corev1.EnvVar{Name: "CELLD_OTEL", Value: "1"})
+		if app.Spec.Telemetry.Retention != "" {
+			env = append(env, corev1.EnvVar{Name: "CELLD_OTEL_RETENTION", Value: app.Spec.Telemetry.Retention})
+		}
+	} else {
+		env = append(env, corev1.EnvVar{Name: "CELLD_OTEL", Value: "0"})
+	}
+
+	volumes := []corev1.Volume{{
+		Name:         "watch",
+		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+	}}
+	mounts := []corev1.VolumeMount{{Name: "watch", MountPath: watchDir}}
+
+	if app.Spec.Vars != nil {
+		volumes = append(volumes, corev1.Volume{
+			Name: "vars",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: app.Spec.Vars.SecretRef,
+			}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: "vars", MountPath: varsDir, ReadOnly: true})
+		env = append(env, corev1.EnvVar{Name: "CELLD_VARS_FILE", Value: varsDir + "/" + varsKey})
+	}
+
+	var envFrom []corev1.EnvFromSource
+	if ref := app.Spec.Bucket.CredentialsFrom.SecretRef; ref != "" {
+		envFrom = append(envFrom, corev1.EnvFromSource{
+			SecretRef: &corev1.SecretEnvSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: ref},
+			},
+		})
+	}
+
+	container := corev1.Container{
+		Name:  celldContainerName,
+		Image: app.Spec.Celld.Image,
+		Args: []string{
+			"--bucket", app.Spec.Bucket.Name,
+			"--listen", fmt.Sprintf("0.0.0.0:%d", publicPort),
+		},
+		Env:     env,
+		EnvFrom: envFrom,
+		Ports: []corev1.ContainerPort{
+			{Name: "public", ContainerPort: publicPort},
+			{Name: "internal", ContainerPort: internalPort},
+		},
+		// Readiness on celld's health path: it answers 503 during a drain,
+		// which pulls the pod from EndpointSlices — the built-in drain
+		// signal (F6).
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+				Path: "/__celld/health",
+				Port: intstr.FromInt32(publicPort),
+			}},
+			PeriodSeconds:    5,
+			FailureThreshold: 3,
+		},
+		// Liveness must NOT use the health path: it goes 503 during a
+		// graceful drain, and an HTTP liveness probe there kills the node
+		// mid-handoff (DESIGN.md §6). TCP only.
+		LivenessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromInt32(publicPort),
+			}},
+			PeriodSeconds:    20,
+			FailureThreshold: 3,
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dGi", memGi)),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dGi", memGi)),
+			},
+		},
+		VolumeMounts: mounts,
+	}
+
+	return corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: fleetLabels(app),
+			Annotations: map[string]string{
+				// The declarative rollout trigger (F4): `celld deploy`
+				// publishes to the bucket, then this annotation bump rolls
+				// the fleet so nodes restart into the new deployment.
+				appVersionAnnotation: app.Spec.AppVersion,
+			},
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName:            fleetName(app),
+			TerminationGracePeriodSeconds: ptr.To(int64(terminationGraceS)),
+			Containers:                    []corev1.Container{container},
+			Volumes:                       volumes,
+		},
+	}
+}
+
+// templateHash fingerprints the desired pod template. Comparing hashes
+// (rather than deep-equality against the server-defaulted live object)
+// decides when a rollout starts.
+func templateHash(t corev1.PodTemplateSpec) string {
+	raw, err := json.Marshal(t)
+	if err != nil {
+		// Marshaling our own built struct cannot fail; keep the signature
+		// simple and make any future surprise loud in the hash comparison.
+		return "marshal-error"
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:8])
+}
+
+func buildStatefulSet(app *platformv1alpha1.WorkerApp) *appsv1.StatefulSet {
+	template := buildPodTemplate(app)
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fleetName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+			Annotations: map[string]string{
+				templateHashAnnotation: templateHash(template),
+			},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			ServiceName: internalServiceName(app),
+			Replicas:    ptr.To(desiredReplicas(app)),
+			Selector:    &metav1.LabelSelector{MatchLabels: selectorLabels(app)},
+			Template:    template,
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+				Type: appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
+					Partition: ptr.To(int32(0)),
+				},
+			},
+		},
+	}
+}
+
+func buildInternalService(app *platformv1alpha1.WorkerApp) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      internalServiceName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: corev1.ClusterIPNone,
+			Selector:  selectorLabels(app),
+			// Peers must reach a draining or not-yet-ready node to hand off
+			// and take over cells; readiness gating would break that.
+			PublishNotReadyAddresses: true,
+			Ports: []corev1.ServicePort{{
+				Name: "internal", Port: internalPort, TargetPort: intstr.FromInt32(internalPort),
+			}},
+		},
+	}
+}
+
+func buildPublicService(app *platformv1alpha1.WorkerApp) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fleetName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: selectorLabels(app),
+			Ports: []corev1.ServicePort{{
+				Name: "public", Port: publicPort, TargetPort: intstr.FromInt32(publicPort),
+			}},
+		},
+	}
+}
+
+func buildServiceAccount(app *platformv1alpha1.WorkerApp) *corev1.ServiceAccount {
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fleetName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+		},
+	}
+	// IRSA: the bucket credential is fleet-admin authority, so it arrives
+	// through the pod identity, scoped to this fleet's prefix (DESIGN.md §4).
+	// GKE Workload Identity wiring is a v1 item; "auto" provisioning is
+	// DESIGN.md §13 open question 2 and is surfaced as a condition.
+	if role := app.Spec.Bucket.CredentialsFrom.IAMRole; role != "" && role != "auto" {
+		sa.Annotations = map[string]string{"eks.amazonaws.com/role-arn": role}
+	}
+	return sa
+}
+
+// buildNetworkPolicy locks the internal listener down: celld's operator API
+// on :8081 is unauthenticated upstream (F1), so only fleet pods and the
+// operator's namespace may reach it. :8080 stays open — the gateway (and
+// mesh policy, where present) fronts it.
+func buildNetworkPolicy(app *platformv1alpha1.WorkerApp, operatorNamespace string) *networkingv1.NetworkPolicy {
+	protoTCP := corev1.ProtocolTCP
+	return &networkingv1.NetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fleetName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+		},
+		Spec: networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{MatchLabels: selectorLabels(app)},
+			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
+			Ingress: []networkingv1.NetworkPolicyIngressRule{
+				{
+					Ports: []networkingv1.NetworkPolicyPort{{
+						Protocol: &protoTCP,
+						Port:     ptr.To(intstr.FromInt32(internalPort)),
+					}},
+					From: []networkingv1.NetworkPolicyPeer{
+						{PodSelector: &metav1.LabelSelector{MatchLabels: selectorLabels(app)}},
+						{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+							"kubernetes.io/metadata.name": operatorNamespace,
+						}}},
+					},
+				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{{
+						Protocol: &protoTCP,
+						Port:     ptr.To(intstr.FromInt32(publicPort)),
+					}},
+				},
+			},
+		},
+	}
+}
+
+// buildPDB keeps voluntary disruptions serialized so node maintenance drains
+// one fleet pod at a time, matching the rollout discipline.
+func buildPDB(app *platformv1alpha1.WorkerApp) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fleetName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+		},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+			Selector:       &metav1.LabelSelector{MatchLabels: selectorLabels(app)},
+		},
+	}
+}
+
+// buildHTTPRoute binds the app's hostnames to the public Service on the
+// shared Gateway. Route policy per DESIGN.md §6: retry the drain 503s so
+// rollouts are invisible to clients, and disable the request timeout for
+// WebSocket apps so quiet hibernated sockets are not severed.
+func buildHTTPRoute(app *platformv1alpha1.WorkerApp, gatewayName, gatewayNamespace string) *gatewayv1.HTTPRoute {
+	hostnames := make([]gatewayv1.Hostname, 0, len(app.Spec.Hostnames))
+	for _, h := range app.Spec.Hostnames {
+		hostnames = append(hostnames, gatewayv1.Hostname(h))
+	}
+	rule := gatewayv1.HTTPRouteRule{
+		BackendRefs: []gatewayv1.HTTPBackendRef{{
+			BackendRef: gatewayv1.BackendRef{
+				BackendObjectReference: gatewayv1.BackendObjectReference{
+					Name: gatewayv1.ObjectName(fleetName(app)),
+					Port: ptr.To(gatewayv1.PortNumber(publicPort)),
+				},
+			},
+		}},
+		Retry: &gatewayv1.HTTPRouteRetry{
+			Codes:    []gatewayv1.HTTPRouteRetryStatusCode{503},
+			Attempts: ptr.To(2),
+		},
+	}
+	if app.Spec.WebSockets {
+		rule.Timeouts = &gatewayv1.HTTPRouteTimeouts{
+			Request: ptr.To(gatewayv1.Duration("0s")),
+		}
+	}
+	return &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fleetName(app),
+			Namespace: app.Namespace,
+			Labels:    fleetLabels(app),
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{{
+					Name:      gatewayv1.ObjectName(gatewayName),
+					Namespace: ptr.To(gatewayv1.Namespace(gatewayNamespace)),
+				}},
+			},
+			Hostnames: hostnames,
+			Rules:     []gatewayv1.HTTPRouteRule{rule},
+		},
+	}
+}
+
+// newUnstructuredObject assembles the envelope for CRDs the operator does
+// not link types for (Istio, KEDA), so their absence never breaks the build
+// or the reconcile.
+func newUnstructuredObject(apiVersion, kind, name, namespace string, labels, annotations map[string]any, spec map[string]any) *unstructured.Unstructured {
+	metadata := map[string]any{
+		"name":      name,
+		"namespace": namespace,
+		"labels":    labels,
+	}
+	if annotations != nil {
+		metadata["annotations"] = annotations
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata":   metadata,
+		"spec":       spec,
+	}}
+}
+
+// buildAuthorizationPolicy adds identity-based enforcement in front of the
+// unauthenticated operator API when Istio is present: only the fleet's own
+// service account and the operator may speak to :8081 (DESIGN.md §7).
+// Unstructured so the operator does not depend on Istio being installed.
+func buildAuthorizationPolicy(app *platformv1alpha1.WorkerApp, operatorPrincipal string) *unstructured.Unstructured {
+	fleetPrincipal := fmt.Sprintf("cluster.local/ns/%s/sa/%s", app.Namespace, fleetName(app))
+	return newUnstructuredObject(
+		"security.istio.io/v1", "AuthorizationPolicy",
+		fleetName(app)+"-internal", app.Namespace,
+		toAnyMap(fleetLabels(app)), nil,
+		map[string]any{
+			"selector": map[string]any{"matchLabels": toAnyMap(selectorLabels(app))},
+			"action":   "ALLOW",
+			"rules": []any{
+				map[string]any{
+					"from": []any{map[string]any{"source": map[string]any{
+						"principals": []any{fleetPrincipal, operatorPrincipal},
+					}}},
+					"to": []any{map[string]any{"operation": map[string]any{
+						"ports": []any{fmt.Sprintf("%d", internalPort)},
+					}}},
+				},
+				map[string]any{
+					"to": []any{map[string]any{"operation": map[string]any{
+						"ports": []any{fmt.Sprintf("%d", publicPort)},
+					}}},
+				},
+			},
+		},
+	)
+}
+
+// buildScaledObject materializes spec.autoscaling as a KEDA ScaledObject
+// over the operator's /state-derived metrics (DESIGN.md §8, Autoscaling).
+// paused pins replicas during rollouts so the scaler and the partition
+// controller never fight.
+func buildScaledObject(app *platformv1alpha1.WorkerApp, prometheusURL string, paused bool) *unstructured.Unstructured {
+	as := app.Spec.Autoscaling
+	minReplicas := as.MinReplicas
+	if minReplicas == 0 {
+		minReplicas = 2
+	}
+	maxReplicas := as.MaxReplicas
+	if maxReplicas == 0 {
+		maxReplicas = 10
+	}
+	target := int32(70)
+	if as.Targets.ResidentCellUtilization != nil {
+		target = *as.Targets.ResidentCellUtilization
+	}
+
+	triggers := []any{
+		promTrigger(prometheusURL,
+			fmt.Sprintf(`avg(celld_resident_cell_utilization{namespace=%q,workerapp=%q})`,
+				app.Namespace, app.Name),
+			fmt.Sprintf("%.2f", float64(target)/100)),
+		// The shedding fast path: any pod refusing new cells means the
+		// fleet is already rebalancing the hard way — scale immediately.
+		promTrigger(prometheusURL,
+			fmt.Sprintf(`max(celld_shedding{namespace=%q,workerapp=%q})`,
+				app.Namespace, app.Name),
+			"0.5"),
+	}
+	if as.Targets.P95LatencyMs != nil {
+		triggers = append(triggers, promTrigger(prometheusURL,
+			fmt.Sprintf(`histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{destination_service_name=%q,reporter="destination"}[5m])) by (le))`,
+				fleetName(app)),
+			fmt.Sprintf("%d", *as.Targets.P95LatencyMs)))
+	}
+
+	// Scale down slowly and one pod at a time: removing a pod hands off its
+	// cells (cold restores on peers) and closes its WebSockets; WebSocket
+	// fleets wait even longer (DESIGN.md §8).
+	stabilizationS := 600
+	if app.Spec.WebSockets {
+		stabilizationS = 1800
+	}
+
+	return newUnstructuredObject(
+		"keda.sh/v1alpha1", "ScaledObject",
+		fleetName(app), app.Namespace,
+		toAnyMap(fleetLabels(app)),
+		map[string]any{kedaPausedAnnotation: fmt.Sprintf("%t", paused)},
+		map[string]any{
+			"scaleTargetRef": map[string]any{
+				"apiVersion": "apps/v1",
+				"kind":       "StatefulSet",
+				"name":       fleetName(app),
+			},
+			"minReplicaCount": int64(minReplicas),
+			"maxReplicaCount": int64(maxReplicas),
+			"advanced": map[string]any{
+				"horizontalPodAutoscalerConfig": map[string]any{
+					"behavior": map[string]any{
+						"scaleDown": map[string]any{
+							"stabilizationWindowSeconds": int64(stabilizationS),
+							"policies": []any{map[string]any{
+								"type": "Pods", "value": int64(1), "periodSeconds": int64(300),
+							}},
+						},
+					},
+				},
+			},
+			"triggers": triggers,
+		},
+	)
+}
+
+// promTrigger is one KEDA Prometheus trigger.
+func promTrigger(serverAddress, query, threshold string) map[string]any {
+	return map[string]any{
+		"type": "prometheus",
+		"metadata": map[string]any{
+			"serverAddress": serverAddress,
+			"query":         query,
+			"threshold":     threshold,
+		},
+	}
+}
+
+func toAnyMap(in map[string]string) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}

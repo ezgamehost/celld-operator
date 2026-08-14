@@ -1,135 +1,85 @@
 # celld-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes operator that turns [celld](https://github.com/denoland/celld) —
+Deno Land's self-hosted Cloudflare Workers & Durable Objects runtime — into a
+platform: one `WorkerApp` custom resource per application provisions and
+operates a complete celld fleet.
 
-## Getting Started
+Read [DESIGN.md](DESIGN.md) first; every behavior below is grounded there.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+## What one WorkerApp reconciles to
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+- **StatefulSet** running the celld fleet, with the guardrails celld's docs
+  require baked in: stable per-pod advertise DNS via a headless Service,
+  readiness on `/__celld/health` (which goes 503 during a graceful drain),
+  TCP-only liveness (an HTTP liveness probe on the health path would kill
+  draining nodes), termination grace above `CELLD_SHUTDOWN_DRAIN_MS`, and an
+  explicit `CELLD_MAX_RSS_MB` derived from the container memory limit.
+- **Services**: public (`:8080`, the Worker) and headless internal (`:8081`,
+  peer protocol + operator API, `publishNotReadyAddresses` so peers can hand
+  off cells during drains).
+- **NetworkPolicy** restricting `:8081` — celld's operator API is
+  unauthenticated upstream — to fleet pods and the operator's namespace, plus
+  an Istio **AuthorizationPolicy** with the same intent when Istio is present.
+- **PodDisruptionBudget** (`maxUnavailable: 1`) so node maintenance drains
+  serially.
+- **HTTPRoute** on a shared Gateway (`--gateway-name` / `--gateway-namespace`)
+  for `spec.hostnames`, with 503 retries so drains are invisible to clients
+  and, for `websockets: true` apps, a disabled request timeout.
+- **KEDA ScaledObject** (when `spec.autoscaling.enabled`) over the operator's
+  own metrics, paused automatically during rollouts.
 
-```sh
-make docker-build docker-push IMG=<some-registry>/celld-operator:tag
-```
+Gateway API, Istio, and KEDA are all optional: a missing CRD is reported as a
+status condition, never a reconcile failure.
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+## Rollouts
 
-**Install the CRDs into the cluster:**
+celld nodes load their application deployment from the fleet bucket **at
+startup only**, and celld's docs require waiting for fleet-wide `restoring=0`
+between node restarts — work that lands on the *peers* of the restarted node,
+which a vanilla rolling update cannot see. So the operator owns the
+StatefulSet partition and steps it one ordinal at a time, gating each step on
+pod readiness **and** a live sweep of every pod's `/state`.
 
-```sh
-make install
-```
+Deploying an app is therefore: `celld deploy` to the bucket, then bump
+`spec.appVersion` — the operator rolls the fleet.
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+celld version bumps roll the same way, except across boundaries upstream
+flags as not rolling-safe (e.g. v0.1 → v0.2): those are refused unless
+`spec.celld.updateStrategy: Recreate` is set, which scales to zero and back —
+an availability event the CR must ask for explicitly.
 
-```sh
-make deploy IMG=<some-registry>/celld-operator:tag
-```
+## Metrics
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+celld exports no metrics yet, so the operator polls each fleet pod's internal
+`/state` and re-exports it as Prometheus metrics: `celld_resident_cells`,
+`celld_resident_cell_utilization` (the primary autoscaling signal),
+`celld_restoring`, `celld_evicting`, `celld_shedding`, `celld_state_up`.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Store qualification
 
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
+celld's fencing needs conditional writes the store must enforce atomically;
+a store that accepts the headers without enforcing them splits ownership
+silently. `hack/cas-hammer` races N concurrent conditional PUTs per round and
+asserts exactly one winner:
 
 ```sh
-make build-installer IMG=<some-registry>/celld-operator:tag
+go run ./hack/cas-hammer --bucket my-bucket --endpoint https://... --writers 8 --rounds 32
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+Run it (plus celld's own `put_cas_contract` test) against any store not on
+the qualified list in DESIGN.md §9, and again on every store upgrade.
 
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
+## Development
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/celld-operator/<tag or branch>/dist/install.yaml
+make test     # envtest suite
+make lint     # golangci-lint
+make run      # run the operator against the current kubeconfig
 ```
 
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+Sample CR: [config/samples/platform_v1alpha1_workerapp.yaml](config/samples/platform_v1alpha1_workerapp.yaml).
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache-2.0
