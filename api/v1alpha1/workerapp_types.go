@@ -162,17 +162,51 @@ type AutoscalingSpec struct {
 	Targets AutoscalingTargets `json:"targets,omitzero"`
 }
 
+// TelemetrySink selects where celld sends traces and logs.
+// +kubebuilder:validation:Enum=bucket;otlp
+type TelemetrySink string
+
+const (
+	// TelemetrySinkBucket writes Parquet under the fleet bucket's
+	// telemetry/ prefix (celld's default; DuckDB-queryable, no services).
+	TelemetrySinkBucket TelemetrySink = "bucket"
+	// TelemetrySinkOTLP sends OTLP/HTTP protobuf to a collector.
+	TelemetrySinkOTLP TelemetrySink = "otlp"
+)
+
 // TelemetrySpec controls celld's built-in tracing (CELLD_OTEL).
 type TelemetrySpec struct {
 	// +optional
 	// +kubebuilder:default=true
 	Enabled *bool `json:"enabled,omitempty"`
 
+	// sink selects the destination: bucket (Parquet in the fleet bucket)
+	// or otlp (an OpenTelemetry collector). Unset means bucket, unless
+	// otlpEndpoint is set — then otlp is inferred.
+	// +optional
+	Sink TelemetrySink `json:"sink,omitempty"`
+
+	// otlpEndpoint is the collector base URL for the otlp sink
+	// (OTEL_EXPORTER_OTLP_ENDPOINT), e.g. "http://otel-collector.monitoring.svc:4318".
+	// Setting it without a sink selects the otlp sink.
+	// +optional
+	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`
+
 	// retention is CELLD_OTEL_RETENTION for the bucket sink, e.g. "30d",
-	// or "none" to defer to bucket lifecycle rules.
+	// or "none" to defer to bucket lifecycle rules. Ignored by the otlp
+	// sink.
 	// +optional
 	// +kubebuilder:default="30d"
 	Retention string `json:"retention,omitempty"`
+}
+
+// ResolvedSink is the sink after defaulting: otlp when selected or implied
+// by otlpEndpoint, bucket otherwise.
+func (t *TelemetrySpec) ResolvedSink() TelemetrySink {
+	if t.Sink == TelemetrySinkOTLP || (t.Sink == "" && t.OTLPEndpoint != "") {
+		return TelemetrySinkOTLP
+	}
+	return TelemetrySinkBucket
 }
 
 // WorkerAppSpec defines the desired state of WorkerApp.

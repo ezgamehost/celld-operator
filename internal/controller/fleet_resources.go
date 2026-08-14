@@ -151,7 +151,17 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash string) corev1
 	telemetryOn := app.Spec.Telemetry.Enabled == nil || *app.Spec.Telemetry.Enabled
 	if telemetryOn {
 		env = append(env, corev1.EnvVar{Name: "CELLD_OTEL", Value: "1"})
-		if app.Spec.Telemetry.Retention != "" {
+		// Per-app service name: on a shared collector, "celld" (the
+		// upstream default) would flatten every fleet into one service.
+		env = append(env, corev1.EnvVar{Name: "OTEL_SERVICE_NAME", Value: app.Name})
+		if app.Spec.Telemetry.ResolvedSink() == platformv1alpha1.TelemetrySinkOTLP {
+			env = append(env, corev1.EnvVar{Name: "CELLD_OTEL_SINK", Value: "otlp"})
+			if app.Spec.Telemetry.OTLPEndpoint != "" {
+				env = append(env, corev1.EnvVar{
+					Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: app.Spec.Telemetry.OTLPEndpoint,
+				})
+			}
+		} else if app.Spec.Telemetry.Retention != "" {
 			env = append(env, corev1.EnvVar{Name: "CELLD_OTEL_RETENTION", Value: app.Spec.Telemetry.Retention})
 		}
 	} else {

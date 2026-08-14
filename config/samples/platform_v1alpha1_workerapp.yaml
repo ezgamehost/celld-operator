@@ -31,4 +31,6 @@ spec:
       p95LatencyMs: 250
   telemetry:
     enabled: true
-    retention: 30d
+    retention: 30d           # bucket sink (default): Parquet in the fleet bucket
+    # sink: otlp             # or send OTLP/HTTP to a collector instead:
+    # otlpEndpoint: http://otel-collector.monitoring.svc:4318

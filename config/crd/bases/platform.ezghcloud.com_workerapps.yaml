@@ -210,11 +210,27 @@ spec:
                   enabled:
                     default: true
                     type: boolean
+                  otlpEndpoint:
+                    description: |-
+                      otlpEndpoint is the collector base URL for the otlp sink
+                      (OTEL_EXPORTER_OTLP_ENDPOINT), e.g. "http://otel-collector.monitoring.svc:4318".
+                      Setting it without a sink selects the otlp sink.
+                    type: string
                   retention:
                     default: 30d
                     description: |-
                       retention is CELLD_OTEL_RETENTION for the bucket sink, e.g. "30d",
-                      or "none" to defer to bucket lifecycle rules.
+                      or "none" to defer to bucket lifecycle rules. Ignored by the otlp
+                      sink.
+                    type: string
+                  sink:
+                    description: |-
+                      sink selects the destination: bucket (Parquet in the fleet bucket)
+                      or otlp (an OpenTelemetry collector). Unset means bucket, unless
+                      otlpEndpoint is set — then otlp is inferred.
+                    enum:
+                    - bucket
+                    - otlp
                     type: string
                 type: object
               vars:

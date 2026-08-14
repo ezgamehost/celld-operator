@@ -123,8 +123,9 @@ spec:
       residentCellUtilization: 70        # % of maxResidentCells, fleet average
       p95LatencyMs: 250                  # optional gateway-side signal
   telemetry:
-    enabled: true                        # CELLD_OTEL=1, Parquet traces in the bucket
-    retention: 30d
+    enabled: true                        # CELLD_OTEL=1; default sink: Parquet in the bucket
+    retention: 30d                       # bucket sink only
+    # otlpEndpoint: http://otel-collector.monitoring.svc:4318   # switches to the otlp sink
 ```
 
 **3. Watch it converge:**
