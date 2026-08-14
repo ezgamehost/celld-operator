@@ -63,11 +63,25 @@ under your operation), not for anonymous hostile code; see DESIGN.md §4.
 
 ## Install
 
-```sh
-# CRDs
-make install
+Via the Helm chart (published to GHCR as an OCI artifact on every release):
 
-# Operator (build and push your image first)
+```sh
+helm install celld-operator oci://ghcr.io/ezgamehost/charts/celld-operator \
+  --namespace celld-operator-system --create-namespace \
+  --set operator.ingressMode=httproute        # or virtualservice / ingress / none
+```
+
+Every operator flag is a value — `operator.ingressMode`,
+`operator.istioGateways`, `operator.ingressClass`, `operator.clusterIssuer`,
+`operator.prometheusURL`, `operator.deployPollInterval`, and friends; see
+[dist/chart/values.yaml](dist/chart/values.yaml). The chart's default image
+tag is its `appVersion`, pinned at package time to the operator build it was
+released with.
+
+Or with kustomize directly:
+
+```sh
+make install                                             # CRDs
 make docker-build docker-push IMG=<registry>/celld-operator:tag
 make deploy IMG=<registry>/celld-operator:tag
 ```

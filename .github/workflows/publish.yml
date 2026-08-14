@@ -46,3 +46,30 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  chart:
+    name: Package and push Helm chart
+    runs-on: ubuntu-latest
+    # The chart's default image tag is its appVersion; publish the image
+    # first so an install of a fresh chart can always pull it.
+    needs: image
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.1.0-main.${{ github.run_number }}"
+          fi
+          helm package dist/chart --version "$VERSION" --app-version "sha-${SHORT_SHA}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Push
+        run: helm push "celld-operator-${VERSION}.tgz" "oci://ghcr.io/${{ github.repository_owner }}/charts"

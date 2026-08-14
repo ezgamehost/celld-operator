@@ -1,0 +1,105 @@
+# [MANAGER]: Manager Deployment Configurations
+controllerManager:
+  replicas: 1
+  container:
+    image:
+      repository: ghcr.io/ezgamehost/celld-operator
+      # Empty tag uses the chart's appVersion (the operator build the
+      # chart was released with).
+      tag: ""
+    imagePullPolicy: IfNotPresent
+    args:
+      - "--leader-elect"
+      - "--metrics-bind-address=:8443"
+      - "--health-probe-bind-address=:8081"
+    resources:
+      limits:
+        cpu: 500m
+        memory: 128Mi
+      requests:
+        cpu: 10m
+        memory: 64Mi
+    livenessProbe:
+      initialDelaySeconds: 15
+      periodSeconds: 20
+      httpGet:
+        path: /healthz
+        port: 8081
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      httpGet:
+        path: /readyz
+        port: 8081
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - "ALL"
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+  terminationGracePeriodSeconds: 10
+  serviceAccountName: celld-operator-controller-manager
+
+# [OPERATOR]: celld-operator behavior; rendered as manager flags.
+operator:
+  # How WorkerApp hostnames are routed:
+  # httproute (Gateway API) | virtualservice (classic Istio) |
+  # ingress (networking.k8s.io/v1) | none
+  ingressMode: httproute
+  # httproute mode: the shared Gateway that HTTPRoutes attach to.
+  gatewayName: edge
+  gatewayNamespace: infra
+  # virtualservice mode: pre-existing networking.istio.io Gateways
+  # ("namespace/name", comma-separated).
+  istioGateways: ""
+  # ingress mode: IngressClass (empty = cluster default) and optional
+  # cert-manager ClusterIssuer for per-app TLS.
+  ingressClass: ""
+  clusterIssuer: ""
+  # Prometheus that KEDA queries for the operator's celld_* metrics.
+  prometheusURL: http://prometheus-operated.monitoring.svc:9090
+  # Poll cadences: fleet /state (metrics) and bucket deploy/current.json
+  # (appVersion "auto" tracking).
+  statePollInterval: 15s
+  deployPollInterval: 60s
+  # Istio principal allowed to reach fleet internal listeners; empty
+  # derives cluster.local/ns/<release namespace>/sa/<service account>.
+  operatorPrincipal: ""
+
+# [RBAC]: To enable RBAC (Permissions) configurations
+rbac:
+  enable: true
+
+# [CRDs]: To enable the CRDs
+crd:
+  # This option determines whether the CRDs are included
+  # in the installation process.
+  enable: true
+
+  # Enabling this option adds the "helm.sh/resource-policy": keep
+  # annotation to the CRD, ensuring it remains installed even when
+  # the Helm release is uninstalled.
+  # NOTE: Removing the CRDs will also remove all cert-manager CR(s)
+  # (Certificates, Issuers, ...) due to garbage collection.
+  keep: true
+
+# [METRICS]: Set to true to generate manifests for exporting metrics.
+# To disable metrics export set false, and ensure that the
+# ControllerManager argument "--metrics-bind-address=:8443" is removed.
+metrics:
+  enable: true
+
+# [PROMETHEUS]: To enable a ServiceMonitor to export metrics to Prometheus set true
+prometheus:
+  enable: false
+
+# [CERT-MANAGER]: To enable cert-manager injection to webhooks set true
+certmanager:
+  enable: false
+
+# [NETWORK POLICIES]: To enable NetworkPolicies set true
+networkPolicy:
+  enable: false

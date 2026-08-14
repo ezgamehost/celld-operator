@@ -6,6 +6,8 @@ cliVersion: 4.15.0
 domain: ezghcloud.com
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v1-alpha: {}
 projectName: celld-operator
 repo: github.com/ezgamehost/celld-operator
 resources:

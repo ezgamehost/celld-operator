@@ -1,0 +1,6 @@
+apiVersion: v2
+name: celld-operator
+description: Kubernetes operator running Cloudflare Workers and Durable Objects fleets on celld
+type: application
+version: 0.1.0
+appVersion: "sha-f1a49f8"
