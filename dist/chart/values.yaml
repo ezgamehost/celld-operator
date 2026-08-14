@@ -89,8 +89,14 @@ crd:
 # [METRICS]: Set to true to generate manifests for exporting metrics.
 # To disable metrics export set false, and ensure that the
 # ControllerManager argument "--metrics-bind-address=:8443" is removed.
+# port/insecure must agree with the --metrics-bind-address and
+# --metrics-secure manager args above (e.g. a plain-HTTP scrape target for
+# a minimal Prometheus: port 8080, insecure true, and args
+# --metrics-bind-address=:8080 --metrics-secure=false).
 metrics:
   enable: true
+  port: 8443
+  insecure: false
 
 # [PROMETHEUS]: To enable a ServiceMonitor to export metrics to Prometheus set true
 prometheus:
