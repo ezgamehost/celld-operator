@@ -325,13 +325,19 @@ func buildInternalService(app *platformv1alpha1.WorkerApp) *corev1.Service {
 }
 
 func buildPublicService(app *platformv1alpha1.WorkerApp) *corev1.Service {
+	serviceType := app.Spec.Service.Type
+	if serviceType == "" {
+		serviceType = corev1.ServiceTypeClusterIP
+	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fleetName(app),
-			Namespace: app.Namespace,
-			Labels:    fleetLabels(app),
+			Name:        fleetName(app),
+			Namespace:   app.Namespace,
+			Labels:      fleetLabels(app),
+			Annotations: app.Spec.Service.Annotations,
 		},
 		Spec: corev1.ServiceSpec{
+			Type:     serviceType,
 			Selector: selectorLabels(app),
 			Ports: []corev1.ServicePort{{
 				Name: "public", Port: publicPort, TargetPort: intstr.FromInt32(publicPort),

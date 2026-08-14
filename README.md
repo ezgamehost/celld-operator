@@ -114,6 +114,9 @@ spec:
     maxResidentCells: 1000
   vars:
     secretRef: chat-vars                 # Secret with key "vars.env" (NAME=value lines) -> CELLD_VARS_FILE
+  # service:                             # shape the serving Service; internal-only apps need no
+  #   type: ClusterIP                    # hostnames at all — consumers use <app>-celld.<ns>.svc:8080
+  #   annotations: {}                    # or LoadBalancer + annotations for a private LB
   websockets: true                       # long idle timeouts, sticky-friendly, slow scale-down
   autoscaling:
     enabled: true

@@ -208,6 +208,10 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 		l, d := live.(*corev1.Service), desired.(*corev1.Service)
 		l.Spec.Selector = d.Spec.Selector
 		l.Spec.Ports = d.Spec.Ports
+		l.Spec.Type = d.Spec.Type
+		// Cloud LB configuration rides on annotations; merge so the cloud
+		// controller's own bookkeeping annotations survive.
+		l.SetAnnotations(mergeStringMaps(l.GetAnnotations(), d.GetAnnotations()))
 	}); err != nil {
 		return fmt.Errorf("public service: %w", err)
 	}

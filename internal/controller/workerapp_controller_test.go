@@ -202,6 +202,35 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(k8sClient.Delete(ctx, ingress)).To(Succeed())
 		})
 
+		It("should shape the serving Service from spec.service", func() {
+			By("requesting an annotated LoadBalancer Service")
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Service = platformv1alpha1.ServiceSpec{
+				Type: corev1.ServiceTypeLoadBalancer,
+				Annotations: map[string]string{
+					"service.beta.kubernetes.io/do-loadbalancer-hostname": "internal.example.com",
+				},
+			}
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, fleetKey, svc)).To(Succeed())
+			Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+			Expect(svc.Annotations).To(HaveKeyWithValue(
+				"service.beta.kubernetes.io/do-loadbalancer-hostname", "internal.example.com"))
+			// The internal peer Service is untouched by spec.service.
+			headless := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: resourceName + "-celld-internal", Namespace: resourceNamespace,
+			}, headless)).To(Succeed())
+			Expect(headless.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
+		})
+
 		It("should refuse a rolling update across a breaking celld boundary", func() {
 			r := reconciler()
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})

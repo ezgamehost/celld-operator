@@ -204,6 +204,29 @@ spec:
                     minimum: 1
                     type: integer
                 type: object
+              service:
+                description: |-
+                  service shapes the serving Service (type, annotations) for internal
+                  consumers and load-balancer setups.
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      annotations merge onto the serving Service; cloud load-balancer
+                      configuration (internal LB flags, protocol hints, health-check
+                      tuning) lives here.
+                    type: object
+                  type:
+                    default: ClusterIP
+                    description: Service Type string describes ingress methods for
+                      a service
+                    enum:
+                    - ClusterIP
+                    - LoadBalancer
+                    - NodePort
+                    type: string
+                type: object
               telemetry:
                 description: TelemetrySpec controls celld's built-in tracing (CELLD_OTEL).
                 properties:

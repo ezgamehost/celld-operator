@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -116,6 +117,25 @@ type VarsSpec struct {
 	// rollout; values are never baked into bundles.
 	// +required
 	SecretRef string `json:"secretRef"`
+}
+
+// ServiceSpec shapes the serving Service that fronts the Worker listener.
+// The default ClusterIP suits ingress backends and internal
+// service-to-service consumers (reachable in-cluster at
+// <app>-celld.<namespace>.svc:8080 with no ingress at all); LoadBalancer
+// provisions a cloud LB — pair with annotations for internal/private load
+// balancers; NodePort suits bare-metal edges.
+type ServiceSpec struct {
+	// +optional
+	// +kubebuilder:validation:Enum=ClusterIP;LoadBalancer;NodePort
+	// +kubebuilder:default=ClusterIP
+	Type corev1.ServiceType `json:"type,omitempty"`
+
+	// annotations merge onto the serving Service; cloud load-balancer
+	// configuration (internal LB flags, protocol hints, health-check
+	// tuning) lives here.
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // AutoscalingTargets are the scale signals (DESIGN.md §8, Autoscaling).
@@ -239,6 +259,11 @@ type WorkerAppSpec struct {
 
 	// +optional
 	Resources ResourcesSpec `json:"resources,omitzero"`
+
+	// service shapes the serving Service (type, annotations) for internal
+	// consumers and load-balancer setups.
+	// +optional
+	Service ServiceSpec `json:"service,omitzero"`
 
 	// +optional
 	Vars *VarsSpec `json:"vars,omitempty"`
