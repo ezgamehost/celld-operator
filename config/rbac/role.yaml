@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - platform.ezghcloud.com
+  resources:
+  - workerapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - platform.ezghcloud.com
+  resources:
+  - workerapps/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - platform.ezghcloud.com
+  resources:
+  - workerapps/status
+  verbs:
+  - get
+  - patch
+  - update
