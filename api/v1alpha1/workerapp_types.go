@@ -240,6 +240,9 @@ type WorkerAppSpec struct {
 	// appVersion names the application deployment in the fleet bucket
 	// (written there by `celld deploy`). Nodes load a deployment at startup
 	// only, so changing this triggers the gated rollout (DESIGN.md §8).
+	// The sentinel "auto" makes the operator follow the bucket's
+	// deploy/current.json instead: `celld deploy` alone rolls the fleet,
+	// within one poll interval, with no CR edit.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	AppVersion string `json:"appVersion"`

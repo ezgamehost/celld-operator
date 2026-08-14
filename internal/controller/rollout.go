@@ -197,12 +197,13 @@ func (r *WorkerAppReconciler) configHash(ctx context.Context, app *platformv1alp
 }
 
 // reconcileFleet drives the StatefulSet toward spec and returns the phase.
-func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv1alpha1.WorkerApp) (fleetOutcome, error) {
+// appVersion is the resolved version (pinned or bucket-tracked).
+func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv1alpha1.WorkerApp, appVersion string) (fleetOutcome, error) {
 	configHash, err := r.configHash(ctx, app)
 	if err != nil {
 		return fleetOutcome{}, err
 	}
-	desired := buildStatefulSet(app, configHash)
+	desired := buildStatefulSet(app, configHash, appVersion)
 	if err := ctrl.SetControllerReference(app, desired, r.Scheme); err != nil {
 		return fleetOutcome{}, err
 	}

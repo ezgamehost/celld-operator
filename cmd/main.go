@@ -114,6 +114,9 @@ func main() {
 		"Istio principal of the operator, allowed by fleet AuthorizationPolicies on the internal port.")
 	flag.DurationVar(&statePollInterval, "state-poll-interval", 15*time.Second,
 		"How often fleet pods' /state endpoints are polled for metrics export.")
+	var deployPollInterval time.Duration
+	flag.DurationVar(&deployPollInterval, "deploy-poll-interval", 60*time.Second,
+		"How often fleet buckets' deploy/current.json is polled for appVersion \"auto\" tracking.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -228,6 +231,7 @@ func main() {
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		State:             stateClient,
+		Deploys:           controller.NewDeployTracker(deployPollInterval),
 		IngressMode:       ingressMode,
 		IstioGateways:     istioGatewayList,
 		IngressClassName:  ingressClass,

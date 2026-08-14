@@ -47,6 +47,7 @@ const (
 	condIngressReady           = "IngressReady"
 	condMeshPolicyReady        = "MeshPolicyReady"
 	condAutoscalingReady       = "AutoscalingReady"
+	condDeployTrackingReady    = "DeployTrackingReady"
 
 	reasonRouteError = "RouteError"
 )
@@ -80,6 +81,10 @@ type WorkerAppReconciler struct {
 	// template-change branch and resets partition progress (observed live),
 	// and stale resourceVersions turn every update into a conflict.
 	Reader client.Reader
+
+	// Deploys caches per-fleet reads of the bucket's deploy/current.json
+	// for appVersion "auto" tracking and pinned-mode drift warnings.
+	Deploys *DeployTracker
 
 	// IngressMode selects how hostnames are routed: httproute (default),
 	// virtualservice, or none.
@@ -138,10 +143,17 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 
-	// The fleet itself, including the gated rollout state machine.
-	outcome, err := r.reconcileFleet(ctx, app)
+	// Resolve which application version the fleet should serve — the
+	// pinned spec value, or the bucket's deploy pointer in auto mode —
+	// then run the fleet's gated rollout state machine against it.
+	appVersion, tracking := r.resolveAppVersion(ctx, app, &conditions)
+	outcome, err := r.reconcileFleet(ctx, app, appVersion)
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if tracking && (outcome.Requeue == 0 || outcome.Requeue > r.Deploys.Interval) {
+		// Auto mode notices a new `celld deploy` within one poll interval.
+		outcome.Requeue = r.Deploys.Interval
 	}
 
 	// Edge, mesh, and autoscaling; each tolerates its CRD being absent so
@@ -158,7 +170,7 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Status: live fleet numbers plus the rollout position.
-	if err := r.updateStatus(ctx, app, outcome, conditions); err != nil {
+	if err := r.updateStatus(ctx, app, outcome, appVersion, conditions); err != nil {
 		if apierrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true}, nil
 		}
@@ -178,7 +190,7 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 	}); err != nil {
 		return fmt.Errorf("service account: %w", err)
 	}
-	if app.Spec.Bucket.CredentialsFrom.IAMRole == "auto" {
+	if app.Spec.Bucket.CredentialsFrom.IAMRole == iamRoleAuto {
 		// DESIGN.md §13 open question 2: automatic IAM provisioning is not
 		// built yet. The fleet still runs; credentials must arrive by
 		// annotating the fleet ServiceAccount (or via secretRef).
@@ -488,14 +500,14 @@ func stringMapSubset(sub, of map[string]string) bool {
 	return true
 }
 
-func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, conditions []metav1.Condition) error {
+func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, appVersion string, conditions []metav1.Condition) error {
 	app.Status.Phase = outcome.Phase
 	app.Status.Rollout = platformv1alpha1.RolloutStatus{
 		Partition: outcome.Partition,
 		WaitingOn: outcome.WaitingOn,
 	}
 	if outcome.RolledOut {
-		app.Status.RolledOutAppVersion = app.Spec.AppVersion
+		app.Status.RolledOutAppVersion = appVersion
 	}
 
 	var sts appsv1.StatefulSet
@@ -557,6 +569,9 @@ func (r *WorkerAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	if r.Reader == nil {
 		r.Reader = mgr.GetAPIReader()
+	}
+	if r.Deploys == nil {
+		r.Deploys = NewDeployTracker(0)
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.WorkerApp{}).

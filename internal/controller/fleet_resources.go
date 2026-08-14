@@ -45,6 +45,12 @@ import (
 const (
 	celldContainerName = "celld"
 
+	// iamRoleAuto asks the operator to provision the role (not implemented;
+	// surfaced as a condition).
+	iamRoleAuto = "auto"
+	// defaultBucketRegion suits R2 and other region-less S3 endpoints.
+	defaultBucketRegion = "auto"
+
 	workerAppLabel = "platform.ezghcloud.com/workerapp"
 
 	appVersionAnnotation   = "platform.ezghcloud.com/app-version"
@@ -119,8 +125,9 @@ func maxResidentCells(app *platformv1alpha1.WorkerApp) int32 {
 // buildPodTemplate is the single source of truth for a fleet pod. The
 // rollout controller compares its hash against the live StatefulSet to
 // decide whether a gated rollout is needed (DESIGN.md §8). configHash
-// digests the referenced Secrets so rotation rolls the fleet.
-func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash string) corev1.PodTemplateSpec {
+// digests the referenced Secrets so rotation rolls the fleet; appVersion
+// is the resolved deployment version (pinned or bucket-tracked).
+func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion string) corev1.PodTemplateSpec {
 	memGi := memoryGi(app)
 	// Explicit RSS threshold ≈80% of the container limit: the upstream
 	// default derives from "available memory" and is not cgroup-aware (F10).
@@ -240,11 +247,13 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash string) corev1
 		VolumeMounts: mounts,
 	}
 
-	annotations := map[string]string{
-		// The declarative rollout trigger (F4): `celld deploy`
-		// publishes to the bucket, then this annotation bump rolls
-		// the fleet so nodes restart into the new deployment.
-		appVersionAnnotation: app.Spec.AppVersion,
+	annotations := map[string]string{}
+	if appVersion != "" {
+		// The declarative rollout trigger (F4): `celld deploy` publishes
+		// to the bucket, then this annotation changing (a spec bump, or
+		// the tracked pointer moving) rolls the fleet so nodes restart
+		// into the new deployment.
+		annotations[appVersionAnnotation] = appVersion
 	}
 	if configHash != "" {
 		annotations[configHashAnnotation] = configHash
@@ -278,8 +287,8 @@ func templateHash(t corev1.PodTemplateSpec) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-func buildStatefulSet(app *platformv1alpha1.WorkerApp, configHash string) *appsv1.StatefulSet {
-	template := buildPodTemplate(app, configHash)
+func buildStatefulSet(app *platformv1alpha1.WorkerApp, configHash, appVersion string) *appsv1.StatefulSet {
+	template := buildPodTemplate(app, configHash, appVersion)
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fleetName(app),
@@ -358,7 +367,7 @@ func buildServiceAccount(app *platformv1alpha1.WorkerApp) *corev1.ServiceAccount
 	// through the pod identity, scoped to this fleet's prefix (DESIGN.md §4).
 	// GKE Workload Identity wiring is a v1 item; "auto" provisioning is
 	// DESIGN.md §13 open question 2 and is surfaced as a condition.
-	if role := app.Spec.Bucket.CredentialsFrom.IAMRole; role != "" && role != "auto" {
+	if role := app.Spec.Bucket.CredentialsFrom.IAMRole; role != "" && role != iamRoleAuto {
 		sa.Annotations = map[string]string{"eks.amazonaws.com/role-arn": role}
 	}
 	return sa

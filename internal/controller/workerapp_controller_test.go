@@ -64,6 +64,7 @@ var _ = Describe("WorkerApp Controller", func() {
 				Scheme:            k8sClient.Scheme(),
 				State:             NewStateClient(),
 				Reader:            k8sClient,
+				Deploys:           NewDeployTracker(0),
 				GatewayName:       "edge",
 				GatewayNamespace:  "infra",
 				PrometheusURL:     "http://prometheus.test:9090",
@@ -229,6 +230,36 @@ var _ = Describe("WorkerApp Controller", func() {
 				Name: resourceName + "-celld-internal", Namespace: resourceNamespace,
 			}, headless)).To(Succeed())
 			Expect(headless.Spec.ClusterIP).To(Equal(corev1.ClusterIPNone))
+		})
+
+		It("should hold the live version when auto tracking cannot reach the bucket", func() {
+			By("creating the fleet pinned, then switching to auto")
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.AppVersion = AppVersionAuto
+			// Point at an unreachable endpoint so the pointer read fails.
+			resource.Spec.Bucket.Endpoint = "http://127.0.0.1:1"
+			resource.Spec.Bucket.CredentialsFrom.SecretRef = ""
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("reporting the failure and keeping the fleet on its live version")
+			updated := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			cond := meta.FindStatusCondition(updated.Status.Conditions, condDeployTrackingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal("BucketUnreachable"))
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			// An unreachable bucket must not trigger a rollout to nowhere:
+			// the template keeps serving the previously pinned version.
+			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(appVersionAnnotation, "sha-test"))
 		})
 
 		It("should refuse a rolling update across a breaking celld boundary", func() {

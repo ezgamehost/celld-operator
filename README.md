@@ -153,6 +153,15 @@ kubectl patch workerapp chat -n tenant-acme --type merge \
 
 (Or bump `appVersion` in git and let your GitOps tool apply it.)
 
+Prefer `celld deploy` to be the whole story? Set `appVersion: auto` and the
+operator follows the bucket's `deploy/current.json` itself — a new publish
+rolls the fleet within one `--deploy-poll-interval` (default 60s), and
+`status.rolledOutAppVersion` reports the concrete version being served. In
+pinned mode the same read powers a `DeployTrackingReady: VersionMismatch`
+warning when the bucket pointer and the CR disagree (nodes always load the
+bucket's version). Tracking reads use the fleet's `secretRef` credentials,
+or the operator's ambient AWS identity otherwise.
+
 The operator then runs a **gated rolling update**, not a vanilla one. celld's
 documented rule is: after restarting a node, wait until *every* node reports
 `restoring=0` before restarting the next — and that restore work lands on the
@@ -245,6 +254,7 @@ them wrong via templates because there are no templates:
 | `--operator-namespace` | `celld-operator-system` | Allowed by fleet NetworkPolicies to reach `:8081` |
 | `--operator-principal` | `cluster.local/ns/celld-operator-system/sa/celld-operator-controller-manager` | Operator identity in Istio AuthorizationPolicies |
 | `--state-poll-interval` | `15s` | `/state` polling cadence for metrics export |
+| `--deploy-poll-interval` | `60s` | Bucket `deploy/current.json` polling cadence for `appVersion: auto` |
 
 ## Store qualification
 
