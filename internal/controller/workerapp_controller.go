@@ -45,6 +45,17 @@ const (
 	condAutoscalingReady       = "AutoscalingReady"
 )
 
+// Ingress modes (--ingress-mode). HTTPRoute is the Gateway API path from
+// DESIGN.md §6; VirtualService targets clusters whose ingress is an
+// existing classic istio-ingressgateway (Gateway API CRDs on the standard
+// channel drop the retry field, and older Istio releases do not attach
+// Gateway API Gateways to pre-existing deployments).
+const (
+	IngressModeHTTPRoute      = "httproute"
+	IngressModeVirtualService = "virtualservice"
+	IngressModeNone           = "none"
+)
+
 // WorkerAppReconciler reconciles one celld fleet per WorkerApp: the
 // StatefulSet and its rollout, both Services, the network and mesh policy
 // around the unauthenticated internal listener, the PDB, the HTTPRoute on
@@ -54,9 +65,15 @@ type WorkerAppReconciler struct {
 	Scheme *runtime.Scheme
 	State  *StateClient
 
-	// The shared edge Gateway that HTTPRoutes attach to.
+	// IngressMode selects how hostnames are routed: httproute (default),
+	// virtualservice, or none.
+	IngressMode string
+	// The shared edge Gateway that HTTPRoutes attach to (httproute mode).
 	GatewayName      string
 	GatewayNamespace string
+	// IstioGateways are the pre-existing networking.istio.io Gateways that
+	// VirtualServices bind to (virtualservice mode), as "namespace/name".
+	IstioGateways []string
 	// PrometheusURL is where KEDA reads the operator's exported metrics.
 	PrometheusURL string
 	// OperatorNamespace is allowed by NetworkPolicy to reach :8081.
@@ -106,7 +123,7 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// Edge, mesh, and autoscaling; each tolerates its CRD being absent so
 	// the operator runs on clusters without Gateway API, Istio, or KEDA and
 	// says so in conditions instead of failing the fleet.
-	r.ensureHTTPRoute(ctx, app, &conditions)
+	r.ensureIngress(ctx, app, &conditions)
 	r.ensureAuthorizationPolicy(ctx, app, &conditions)
 	r.ensureScaledObject(ctx, app, outcome, &conditions)
 
@@ -204,10 +221,42 @@ func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1a
 	return r.Update(ctx, live)
 }
 
-func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
+func (r *WorkerAppReconciler) ensureIngress(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
 	if len(app.Spec.Hostnames) == 0 {
 		return
 	}
+	switch r.IngressMode {
+	case IngressModeNone:
+	case IngressModeVirtualService:
+		r.ensureVirtualService(ctx, app, conditions)
+	default:
+		r.ensureHTTPRoute(ctx, app, conditions)
+	}
+}
+
+func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
+	vs := buildVirtualService(app, r.IstioGateways)
+	err := r.ensureUnstructured(ctx, app, vs)
+	switch {
+	case err == nil:
+		*conditions = append(*conditions, metav1.Condition{
+			Type: condIngressReady, Status: metav1.ConditionTrue, Reason: "VirtualServiceReconciled",
+		})
+	case meta.IsNoMatchError(err):
+		*conditions = append(*conditions, metav1.Condition{
+			Type: condIngressReady, Status: metav1.ConditionFalse,
+			Reason:  "IstioUnavailable",
+			Message: "networking.istio.io CRDs are not installed; hostnames are not routed",
+		})
+	default:
+		*conditions = append(*conditions, metav1.Condition{
+			Type: condIngressReady, Status: metav1.ConditionFalse,
+			Reason: "RouteError", Message: err.Error(),
+		})
+	}
+}
+
+func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) {
 	route := buildHTTPRoute(app, r.GatewayName, r.GatewayNamespace)
 	err := r.ensureObject(ctx, app, route, func(live, desired client.Object) {
 		l, d := live.(*gatewayv1.HTTPRoute), desired.(*gatewayv1.HTTPRoute)

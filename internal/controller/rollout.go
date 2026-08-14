@@ -253,17 +253,31 @@ func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1al
 
 	// Gate 2: fleet-wide restoring == 0, from a live sweep of every pod's
 	// internal /state. The cold work lands on the peers, so the whole fleet
-	// is polled, and an unreachable pod holds the gate — never step on
-	// missing data.
+	// is polled. A pod that is Ready but unreachable holds the gate — never
+	// step on missing data. A pod that is unreachable AND not Ready holds
+	// no cells (celld is not serving) and is skipped: otherwise a fleet
+	// that was never healthy could never roll out the fix for what broke
+	// it, and the gate becomes a deadlock.
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app))); err != nil {
 		return fleetOutcome{}, err
 	}
-	_, restoring, err := r.State.FleetSweep(ctx, pods.Items)
-	if err != nil {
-		out.WaitingOn = "state unreachable: " + err.Error()
-		out.Requeue = 15 * time.Second
-		return out, nil
+	var restoring int64
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		state, err := r.State.Fetch(ctx, pod.Status.PodIP)
+		if err != nil {
+			if podReady(pod) {
+				out.WaitingOn = fmt.Sprintf("state unreachable: pod %s: %v", pod.Name, err)
+				out.Requeue = 15 * time.Second
+				return out, nil
+			}
+			continue
+		}
+		restoring += state.Restoring
 	}
 	if restoring > 0 {
 		out.WaitingOn = fmt.Sprintf("fleet: restoring=%d", restoring)

@@ -455,6 +455,43 @@ func newUnstructuredObject(apiVersion, kind, name, namespace string, labels, ann
 	}}
 }
 
+// buildVirtualService is the classic-Istio counterpart of buildHTTPRoute,
+// for clusters whose ingress is an existing istio-ingressgateway rather
+// than a Gateway API implementation (--ingress-mode=virtualservice). Same
+// route policy: retry the drain 503s so rollouts stay invisible to
+// clients. It binds to pre-existing gateways named by the operator flags;
+// gateway lifecycle stays out of the operator, matching the shared-Gateway
+// model.
+func buildVirtualService(app *platformv1alpha1.WorkerApp, gateways []string) *unstructured.Unstructured {
+	hosts := make([]any, 0, len(app.Spec.Hostnames))
+	for _, h := range app.Spec.Hostnames {
+		hosts = append(hosts, h)
+	}
+	gws := make([]any, 0, len(gateways))
+	for _, g := range gateways {
+		gws = append(gws, g)
+	}
+	return newUnstructuredObject(
+		"networking.istio.io/v1", "VirtualService",
+		fleetName(app), app.Namespace,
+		toAnyMap(fleetLabels(app)), nil,
+		map[string]any{
+			"hosts":    hosts,
+			"gateways": gws,
+			"http": []any{map[string]any{
+				"route": []any{map[string]any{"destination": map[string]any{
+					"host": fmt.Sprintf("%s.%s.svc.cluster.local", fleetName(app), app.Namespace),
+					"port": map[string]any{"number": int64(publicPort)},
+				}}},
+				"retries": map[string]any{
+					"attempts": int64(2),
+					"retryOn":  "connect-failure,refused-stream,503",
+				},
+			}},
+		},
+	)
+}
+
 // buildAuthorizationPolicy adds identity-based enforcement in front of the
 // unauthenticated operator API when Istio is present: only the fleet's own
 // service account and the operator may speak to :8081 (DESIGN.md §7).

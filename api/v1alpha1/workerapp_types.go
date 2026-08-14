@@ -246,16 +246,17 @@ type RolloutStatus struct {
 	WaitingOn string `json:"waitingOn,omitempty"`
 }
 
-// FleetStatus aggregates the per-pod /state the operator polls.
+// FleetStatus aggregates the per-pod /state the operator polls. The fields
+// serialize even at zero so `kubectl get` renders 0 rather than a blank.
 type FleetStatus struct {
 	// ready is the number of pods passing the celld health check.
 	// +optional
-	Ready int32 `json:"ready,omitempty"`
+	Ready int32 `json:"ready"`
 
 	// restoring is the fleet-wide sum of cold routes holding or awaiting an
 	// activation permit. Rollouts step only at restoring == 0.
 	// +optional
-	Restoring int32 `json:"restoring,omitempty"`
+	Restoring int32 `json:"restoring"`
 }
 
 // WorkerAppStatus defines the observed state of WorkerApp.

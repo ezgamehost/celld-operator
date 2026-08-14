@@ -231,7 +231,9 @@ them wrong via templates because there are no templates:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--gateway-name` | `edge` | Shared Gateway that HTTPRoutes attach to |
+| `--ingress-mode` | `httproute` | How hostnames are routed: `httproute` (Gateway API), `virtualservice` (classic Istio — for clusters whose ingress is an existing istio-ingressgateway), or `none` |
+| `--istio-gateways` | — | Pre-existing `networking.istio.io` Gateways (`namespace/name`, comma-separated) that VirtualServices bind to in `virtualservice` mode |
+| `--gateway-name` | `edge` | Shared Gateway that HTTPRoutes attach to (`httproute` mode) |
 | `--gateway-namespace` | `infra` | Namespace of that Gateway |
 | `--prometheus-url` | `http://prometheus-operated.monitoring.svc:9090` | Where KEDA queries the operator's `celld_*` metrics |
 | `--operator-namespace` | `celld-operator-system` | Allowed by fleet NetworkPolicies to reach `:8081` |

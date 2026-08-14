@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -85,7 +86,13 @@ func main() {
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
 	var gatewayName, gatewayNamespace, prometheusURL, operatorNamespace, operatorPrincipal string
+	var ingressMode, istioGateways string
 	var statePollInterval time.Duration
+	flag.StringVar(&ingressMode, "ingress-mode", controller.IngressModeHTTPRoute,
+		"How WorkerApp hostnames are routed: httproute (Gateway API), virtualservice (classic Istio), or none.")
+	flag.StringVar(&istioGateways, "istio-gateways", "",
+		"Comma-separated pre-existing networking.istio.io Gateways (namespace/name) "+
+			"that VirtualServices bind to in virtualservice mode.")
 	flag.StringVar(&gatewayName, "gateway-name", "edge",
 		"Name of the shared Gateway that WorkerApp HTTPRoutes attach to.")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "infra",
@@ -199,10 +206,16 @@ func main() {
 	}
 
 	stateClient := controller.NewStateClient()
+	var istioGatewayList []string
+	if istioGateways != "" {
+		istioGatewayList = strings.Split(istioGateways, ",")
+	}
 	if err := (&controller.WorkerAppReconciler{
 		Client:            mgr.GetClient(),
 		Scheme:            mgr.GetScheme(),
 		State:             stateClient,
+		IngressMode:       ingressMode,
+		IstioGateways:     istioGatewayList,
 		GatewayName:       gatewayName,
 		GatewayNamespace:  gatewayNamespace,
 		PrometheusURL:     prometheusURL,

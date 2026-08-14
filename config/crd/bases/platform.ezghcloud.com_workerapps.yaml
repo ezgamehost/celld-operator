@@ -304,8 +304,9 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               fleet:
-                description: FleetStatus aggregates the per-pod /state the operator
-                  polls.
+                description: |-
+                  FleetStatus aggregates the per-pod /state the operator polls. The fields
+                  serialize even at zero so `kubectl get` renders 0 rather than a blank.
                 properties:
                   ready:
                     description: ready is the number of pods passing the celld health
