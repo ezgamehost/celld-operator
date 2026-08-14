@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -377,12 +378,8 @@ func (r *WorkerAppReconciler) ensureUnstructured(ctx context.Context, app *platf
 // survive.
 func mergeStringMaps(live, desired map[string]string) map[string]string {
 	out := make(map[string]string, len(live)+len(desired))
-	for k, v := range live {
-		out[k] = v
-	}
-	for k, v := range desired {
-		out[k] = v
-	}
+	maps.Copy(out, live)
+	maps.Copy(out, desired)
 	return out
 }
 
