@@ -82,14 +82,24 @@ func init() {
 }
 
 // PodState is one pod's /state sample. The response schema is celld's alpha
-// operator API: keep parsing tolerant, fail per-pod not per-fleet, and pin
-// operator and celld releases together (DESIGN.md §11).
+// operator API (main.rs state_json): keep parsing tolerant, fail per-pod
+// not per-fleet, and pin operator and celld releases together (DESIGN.md
+// §11).
 type PodState struct {
-	Occupied  int64 `json:"occupied"`
-	Evicting  int64 `json:"evicting"`
+	Occupied int64 `json:"occupied"`
+	Evicting int64 `json:"evicting"`
+	// Restoring is state_json's activation backlog.
 	Restoring int64 `json:"restoring"`
-	Shedding  bool  `json:"shedding"`
+	// Shedding is null while healthy and a reason string (e.g. "rss")
+	// during pressure shedding — the wire value is the shed reason, not a
+	// boolean. Decoding it as bool worked on null and failed exactly when
+	// a node started shedding, killing that pod's metrics and holding
+	// rollout gates at the worst moment.
+	Shedding *string `json:"shedding"`
 }
+
+// IsShedding reports whether the node is refusing new cells under pressure.
+func (s *PodState) IsShedding() bool { return s.Shedding != nil }
 
 // StateClient fetches /state from fleet pods.
 type StateClient struct {
@@ -214,7 +224,7 @@ func (p *StatePoller) sweep(ctx context.Context) error {
 			metricEvicting.With(labels).Set(float64(state.Evicting))
 			metricRestoring.With(labels).Set(float64(state.Restoring))
 			metricUtilization.With(labels).Set(float64(state.Occupied) / maxCells)
-			if state.Shedding {
+			if state.IsShedding() {
 				metricShedding.With(labels).Set(1)
 			} else {
 				metricShedding.With(labels).Set(0)
