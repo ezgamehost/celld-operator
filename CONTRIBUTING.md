@@ -44,8 +44,11 @@ By contributing you certify the
 ## Commit messages and releases
 
 Commits on main follow [Conventional Commits](https://www.conventionalcommits.org):
-`feat:` cuts a minor release, `fix:` a patch, a `BREAKING CHANGE:` footer a
-major, and `chore:`/`docs:`/`ci:` cut nothing. semantic-release runs on
+`feat:` cuts a minor release, `fix:` a patch, and `chore:`/`docs:`/`ci:` cut
+nothing. While the project is pre-1.0, a breaking change (`!` or a
+`BREAKING CHANGE:` footer) also cuts a *minor* release — still mark it, so it
+lands in the release notes; graduating to 1.0 means dropping that rule from
+`.releaserc.json`. semantic-release runs on
 every main push after CI: it derives the version from the commits since the
 last tag, creates the tag and the GitHub Release with generated notes, and
 the same workflow then publishes the matching `v<version>` operator image
