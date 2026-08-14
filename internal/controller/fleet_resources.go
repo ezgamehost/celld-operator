@@ -51,10 +51,10 @@ const (
 	// defaultBucketRegion suits R2 and other region-less S3 endpoints.
 	defaultBucketRegion = "auto"
 
-	workerAppLabel = "platform.ezghcloud.com/workerapp"
+	workerAppLabel = "celld-operator.io/workerapp"
 
-	appVersionAnnotation   = "platform.ezghcloud.com/app-version"
-	templateHashAnnotation = "platform.ezghcloud.com/template-hash"
+	appVersionAnnotation   = "celld-operator.io/app-version"
+	templateHashAnnotation = "celld-operator.io/template-hash"
 	kedaPausedAnnotation   = "autoscaling.keda.sh/paused"
 
 	publicPort   = 8080
@@ -78,7 +78,7 @@ const (
 	// changes the digest, which changes the template, which triggers the
 	// ordinary gated rollout — without it, rotation silently did nothing
 	// until some unrelated rollout happened to restart the fleet.
-	configHashAnnotation = "platform.ezghcloud.com/config-hash"
+	configHashAnnotation = "celld-operator.io/config-hash"
 )
 
 func fleetName(app *platformv1alpha1.WorkerApp) string {

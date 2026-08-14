@@ -103,7 +103,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - platform.ezghcloud.com
+  - celld-operator.io
   resources:
   - workerapps
   verbs:
@@ -115,13 +115,13 @@ rules:
   - update
   - watch
 - apiGroups:
-  - platform.ezghcloud.com
+  - celld-operator.io
   resources:
   - workerapps/finalizers
   verbs:
   - update
 - apiGroups:
-  - platform.ezghcloud.com
+  - celld-operator.io
   resources:
   - workerapps/status
   verbs:

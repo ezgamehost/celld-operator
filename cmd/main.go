@@ -198,7 +198,7 @@ func main() {
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "c849b945.ezghcloud.com",
+		LeaderElectionID:       "c849b945.celld-operator.io",
 		// Secrets are read for the config-hash (rotation-triggered
 		// rollouts) but must not be cached: a cached read would start a
 		// cluster-wide Secret informer and hold every Secret in memory.

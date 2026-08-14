@@ -110,9 +110,9 @@ type WorkerAppReconciler struct {
 	OperatorPrincipal string
 }
 
-// +kubebuilder:rbac:groups=platform.ezghcloud.com,resources=workerapps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=platform.ezghcloud.com,resources=workerapps/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=platform.ezghcloud.com,resources=workerapps/finalizers,verbs=update
+// +kubebuilder:rbac:groups=celld-operator.io,resources=workerapps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=celld-operator.io,resources=workerapps/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=celld-operator.io,resources=workerapps/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch

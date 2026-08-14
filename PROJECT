@@ -3,7 +3,7 @@
 # and allow the plugins properly work.
 # More info: https://book.kubebuilder.io/reference/project-config.html
 cliVersion: 4.15.0
-domain: ezghcloud.com
+domain: celld-operator.io
 layout:
 - go.kubebuilder.io/v4
 plugins:
@@ -15,8 +15,9 @@ resources:
     crdVersion: v1
     namespaced: true
   controller: true
-  domain: ezghcloud.com
-  group: platform
+  domain: celld-operator.io
+  group: ""
+  # Empty group: the CRD group is the domain itself (celld-operator.io).
   kind: WorkerApp
   path: github.com/ezgamehost/celld-operator/api/v1alpha1
   version: v1alpha1

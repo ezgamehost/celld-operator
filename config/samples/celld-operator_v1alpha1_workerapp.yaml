@@ -1,4 +1,4 @@
-apiVersion: platform.ezghcloud.com/v1alpha1
+apiVersion: celld-operator.io/v1alpha1
 kind: WorkerApp
 metadata:
   labels:

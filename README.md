@@ -10,6 +10,9 @@ operator supplies that control plane. One `WorkerApp` custom resource
 provisions and operates a complete celld fleet: workload, networking, security
 policy, ingress, gated rollouts, metrics, and autoscaling.
 
+**Documentation: [celld-operator.io](https://celld-operator.io)** — installation,
+the WorkerApp reference, networking, autoscaling, and operations guides.
+
 > **Status: alpha.** celld itself is an alpha and this operator tracks it
 > release-for-release. The celld behaviors the operator encodes are indexed
 > in [docs/celld-behaviors.md](docs/celld-behaviors.md); this README is the
@@ -106,7 +109,7 @@ celld deploy . --bucket s3://platform-cells/apps/chat \
 **2. Create the WorkerApp:**
 
 ```yaml
-apiVersion: platform.ezghcloud.com/v1alpha1
+apiVersion: celld-operator.io/v1alpha1
 kind: WorkerApp
 metadata:
   name: chat
@@ -315,6 +318,12 @@ Layout: `api/v1alpha1` (the `WorkerApp` types), `internal/controller`
 `fleetstate.go` the `/state` poller and metrics), `hack/cas-hammer`, and
 [docs/celld-behaviors.md](docs/celld-behaviors.md) for the celld behaviors
 each guardrail encodes.
+
+## Links
+
+- Documentation: [celld-operator.io](https://celld-operator.io)
+  ([source](https://github.com/ezgamehost/celld-operator.io))
+- Upstream runtime: [celld](https://github.com/denoland/celld) by Deno Land
 
 ## License
 

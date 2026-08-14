@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: workerapps.platform.ezghcloud.com
+  name: workerapps.celld-operator.io
 spec:
-  group: platform.ezghcloud.com
+  group: celld-operator.io
   names:
     kind: WorkerApp
     listKind: WorkerAppList

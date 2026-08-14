@@ -51,6 +51,32 @@ rules:
   - update
   - watch
 - apiGroups:
+  - celld-operator.io
+  resources:
+  - workerapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - celld-operator.io
+  resources:
+  - workerapps/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - celld-operator.io
+  resources:
+  - workerapps/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
   - gateway.networking.k8s.io
   resources:
   - httproutes
@@ -99,32 +125,6 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - platform.ezghcloud.com
-  resources:
-  - workerapps
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - platform.ezghcloud.com
-  resources:
-  - workerapps/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - platform.ezghcloud.com
-  resources:
-  - workerapps/status
-  verbs:
-  - get
-  - patch
-  - update
 - apiGroups:
   - policy
   resources:
