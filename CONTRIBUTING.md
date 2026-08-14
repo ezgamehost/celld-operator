@@ -39,8 +39,16 @@ By contributing you certify the
 [Developer Certificate of Origin](https://developercertificate.org/); add a
 `Signed-off-by` trailer (`git commit -s`) to your commits.
 
-## Releases
+## Commit messages and releases
 
-Pushing a `v*` tag publishes the operator image and the Helm chart with
-matching versions; main-branch pushes publish `sha-*` images and
-`0.1.0-main.N` prerelease charts continuously.
+Commits on main follow [Conventional Commits](https://www.conventionalcommits.org):
+`feat:` cuts a minor release, `fix:` a patch, a `BREAKING CHANGE:` footer a
+major, and `chore:`/`docs:`/`ci:` cut nothing. semantic-release runs on
+every main push after CI: it derives the version from the commits since the
+last tag, creates the tag and the GitHub Release with generated notes, and
+the same workflow then publishes the matching `v<version>` operator image
+(a retag of that commit's `sha-*` image, so the released image is
+bit-identical to the tested one) and the `<version>` Helm chart.
+
+Main-branch pushes also publish `sha-*` images and `0.1.0-main.N`
+prerelease charts continuously, release or not.
