@@ -600,10 +600,15 @@ func buildScaledObject(app *platformv1alpha1.WorkerApp, prometheusURL string, pa
 	)
 }
 
-// promTrigger is one KEDA Prometheus trigger.
+// promTrigger is one KEDA Prometheus trigger. metricType Value, not the
+// KEDA default AverageValue: the queries are already fleet aggregates
+// (avg/max), and AverageValue would divide them by the replica count
+// again — 0.9 average utilization across 2 pods reads as 0.45 and never
+// crosses a 0.5 target. Found live.
 func promTrigger(serverAddress, query, threshold string) map[string]any {
 	return map[string]any{
-		"type": "prometheus",
+		"type":       "prometheus",
+		"metricType": "Value",
 		"metadata": map[string]any{
 			"serverAddress": serverAddress,
 			"query":         query,

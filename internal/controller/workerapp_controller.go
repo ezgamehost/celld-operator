@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -218,7 +219,7 @@ func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1a
 		return err
 	}
 	mutate(live, desired)
-	live.SetLabels(desired.GetLabels())
+	live.SetLabels(mergeStringMaps(live.GetLabels(), desired.GetLabels()))
 	return r.Update(ctx, live)
 }
 
@@ -356,10 +357,42 @@ func (r *WorkerAppReconciler) ensureUnstructured(ctx context.Context, app *platf
 	if err != nil {
 		return err
 	}
+	// Merge, never replace, metadata — other controllers annotate and
+	// label these objects (KEDA stamps ScaledObjects with a name label),
+	// and wiping their keys puts both controllers in a conflict loop.
+	// Skip the update entirely when our spec and metadata are already in
+	// place, so a steady-state reconcile writes nothing.
+	if reflect.DeepEqual(live.Object["spec"], desired.Object["spec"]) &&
+		stringMapSubset(desired.GetLabels(), live.GetLabels()) &&
+		stringMapSubset(desired.GetAnnotations(), live.GetAnnotations()) {
+		return nil
+	}
 	live.Object["spec"] = desired.Object["spec"]
-	live.SetLabels(desired.GetLabels())
-	live.SetAnnotations(desired.GetAnnotations())
+	live.SetLabels(mergeStringMaps(live.GetLabels(), desired.GetLabels()))
+	live.SetAnnotations(mergeStringMaps(live.GetAnnotations(), desired.GetAnnotations()))
 	return r.Update(ctx, live)
+}
+
+// mergeStringMaps overlays desired onto live: our keys win, foreign keys
+// survive.
+func mergeStringMaps(live, desired map[string]string) map[string]string {
+	out := make(map[string]string, len(live)+len(desired))
+	for k, v := range live {
+		out[k] = v
+	}
+	for k, v := range desired {
+		out[k] = v
+	}
+	return out
+}
+
+func stringMapSubset(sub, of map[string]string) bool {
+	for k, v := range sub {
+		if of[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, conditions []metav1.Condition) error {
