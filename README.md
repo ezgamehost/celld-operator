@@ -232,8 +232,10 @@ them wrong via templates because there are no templates:
 
 | Flag | Default | Purpose |
 | --- | --- | --- |
-| `--ingress-mode` | `httproute` | How hostnames are routed: `httproute` (Gateway API), `virtualservice` (classic Istio — for clusters whose ingress is an existing istio-ingressgateway), or `none` |
+| `--ingress-mode` | `httproute` | How hostnames are routed: `httproute` (Gateway API), `virtualservice` (classic Istio — for clusters whose ingress is an existing istio-ingressgateway), `ingress` (`networking.k8s.io/v1`, for ingress-nginx/Traefik/cloud controllers), or `none` |
 | `--istio-gateways` | — | Pre-existing `networking.istio.io` Gateways (`namespace/name`, comma-separated) that VirtualServices bind to in `virtualservice` mode |
+| `--ingress-class` | cluster default | IngressClass for `ingress` mode |
+| `--cluster-issuer` | — | cert-manager ClusterIssuer for `ingress` mode; when set, each app's Ingress requests its own TLS certificate. In this mode the drain-503 retry and WebSocket timeout policies are expressed as ingress-nginx annotations (ignored by other controllers) |
 | `--gateway-name` | `edge` | Shared Gateway that HTTPRoutes attach to (`httproute` mode) |
 | `--gateway-namespace` | `infra` | Namespace of that Gateway |
 | `--prometheus-url` | `http://prometheus-operated.monitoring.svc:9090` | Where KEDA queries the operator's `celld_*` metrics |

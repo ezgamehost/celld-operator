@@ -480,6 +480,76 @@ func newUnstructuredObject(apiVersion, kind, name, namespace string, labels, ann
 	}}
 }
 
+// buildIngress is the networking.k8s.io/v1 counterpart of buildHTTPRoute,
+// for clusters fronted by a classic ingress controller
+// (--ingress-mode=ingress). The route policy carries over as annotations:
+// drain 503s are retried and WebSocket routes get long proxy timeouts —
+// expressed in ingress-nginx vocabulary, ignored by other controllers.
+// With --cluster-issuer set, cert-manager issues per-app TLS via the
+// standard annotation.
+func buildIngress(app *platformv1alpha1.WorkerApp, className, clusterIssuer string) *networkingv1.Ingress {
+	pathType := networkingv1.PathTypePrefix
+	rules := make([]networkingv1.IngressRule, 0, len(app.Spec.Hostnames))
+	for _, host := range app.Spec.Hostnames {
+		rules = append(rules, networkingv1.IngressRule{
+			Host: host,
+			IngressRuleValue: networkingv1.IngressRuleValue{
+				HTTP: &networkingv1.HTTPIngressRuleValue{
+					Paths: []networkingv1.HTTPIngressPath{{
+						Path:     "/",
+						PathType: &pathType,
+						Backend: networkingv1.IngressBackend{
+							Service: &networkingv1.IngressServiceBackend{
+								Name: fleetName(app),
+								Port: networkingv1.ServiceBackendPort{Number: publicPort},
+							},
+						},
+					}},
+				},
+			},
+		})
+	}
+
+	annotations := map[string]string{
+		// A draining celld node answers new requests with 503+close and
+		// expects the client to retry on a healthy node (F6); make the
+		// ingress controller be that client.
+		"nginx.ingress.kubernetes.io/proxy-next-upstream":       "error timeout http_503",
+		"nginx.ingress.kubernetes.io/proxy-next-upstream-tries": "3",
+	}
+	if app.Spec.WebSockets {
+		// Long-lived, possibly hibernated sockets must not be severed by
+		// proxy idle timeouts; clients keep them warm with pings answered
+		// by setWebSocketAutoResponse without waking the cell.
+		annotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = "3600"
+		annotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = "3600"
+	}
+
+	spec := networkingv1.IngressSpec{Rules: rules}
+	if className != "" {
+		spec.IngressClassName = &className
+	}
+	if clusterIssuer != "" {
+		annotations["cert-manager.io/cluster-issuer"] = clusterIssuer
+		hosts := make([]string, len(app.Spec.Hostnames))
+		copy(hosts, app.Spec.Hostnames)
+		spec.TLS = []networkingv1.IngressTLS{{
+			Hosts:      hosts,
+			SecretName: fleetName(app) + "-tls",
+		}}
+	}
+
+	return &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        fleetName(app),
+			Namespace:   app.Namespace,
+			Labels:      fleetLabels(app),
+			Annotations: annotations,
+		},
+		Spec: spec,
+	}
+}
+
 // buildVirtualService is the classic-Istio counterpart of buildHTTPRoute,
 // for clusters whose ingress is an existing istio-ingressgateway rather
 // than a Gateway API implementation (--ingress-mode=virtualservice). Same

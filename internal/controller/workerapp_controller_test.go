@@ -167,6 +167,41 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(mesh.Reason).To(Equal("IstioUnavailable"))
 		})
 
+		It("should emit a v1 Ingress with TLS and route policy in ingress mode", func() {
+			By("adding hostnames and reconciling in ingress mode")
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Hostnames = []string{"test.example.com"}
+			resource.Spec.WebSockets = true
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+
+			r := reconciler()
+			r.IngressMode = IngressModeIngress
+			r.IngressClassName = "nginx"
+			r.ClusterIssuer = "letsencrypt"
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			ingress := &networkingv1.Ingress{}
+			Expect(k8sClient.Get(ctx, fleetKey, ingress)).To(Succeed())
+			Expect(*ingress.Spec.IngressClassName).To(Equal("nginx"))
+			Expect(ingress.Spec.Rules[0].Host).To(Equal("test.example.com"))
+			backend := ingress.Spec.Rules[0].HTTP.Paths[0].Backend.Service
+			Expect(backend.Name).To(Equal(resourceName + "-celld"))
+			Expect(backend.Port.Number).To(Equal(int32(8080)))
+			// cert-manager TLS via the cluster issuer.
+			Expect(ingress.Annotations).To(HaveKeyWithValue("cert-manager.io/cluster-issuer", "letsencrypt"))
+			Expect(ingress.Spec.TLS[0].SecretName).To(Equal(resourceName + "-celld-tls"))
+			// Route policy as annotations: drain-503 retries always, long
+			// proxy timeouts for the WebSocket profile.
+			Expect(ingress.Annotations["nginx.ingress.kubernetes.io/proxy-next-upstream"]).
+				To(ContainSubstring("http_503"))
+			Expect(ingress.Annotations).To(HaveKey("nginx.ingress.kubernetes.io/proxy-read-timeout"))
+
+			By("cleaning up the Ingress (no GC in envtest)")
+			Expect(k8sClient.Delete(ctx, ingress)).To(Succeed())
+		})
+
 		It("should refuse a rolling update across a breaking celld boundary", func() {
 			r := reconciler()
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})

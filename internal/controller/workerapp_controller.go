@@ -47,6 +47,8 @@ const (
 	condIngressReady           = "IngressReady"
 	condMeshPolicyReady        = "MeshPolicyReady"
 	condAutoscalingReady       = "AutoscalingReady"
+
+	reasonRouteError = "RouteError"
 )
 
 // Ingress modes (--ingress-mode). HTTPRoute is the Gateway API path from
@@ -57,7 +59,11 @@ const (
 const (
 	IngressModeHTTPRoute      = "httproute"
 	IngressModeVirtualService = "virtualservice"
-	IngressModeNone           = "none"
+	// IngressModeIngress emits networking.k8s.io/v1 Ingress objects, for
+	// clusters fronted by a classic ingress controller (ingress-nginx,
+	// Traefik, cloud LB controllers).
+	IngressModeIngress = "ingress"
+	IngressModeNone    = "none"
 )
 
 // WorkerAppReconciler reconciles one celld fleet per WorkerApp: the
@@ -84,6 +90,12 @@ type WorkerAppReconciler struct {
 	// IstioGateways are the pre-existing networking.istio.io Gateways that
 	// VirtualServices bind to (virtualservice mode), as "namespace/name".
 	IstioGateways []string
+	// IngressClassName selects the controller in ingress mode; empty uses
+	// the cluster default IngressClass.
+	IngressClassName string
+	// ClusterIssuer, when set, adds the cert-manager annotation and a TLS
+	// block to emitted Ingresses so each app gets a certificate.
+	ClusterIssuer string
 	// PrometheusURL is where KEDA reads the operator's exported metrics.
 	PrometheusURL string
 	// OperatorNamespace is allowed by NetworkPolicy to reach :8081.
@@ -101,7 +113,7 @@ type WorkerAppReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies;ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
@@ -258,9 +270,33 @@ func (r *WorkerAppReconciler) ensureIngress(ctx context.Context, app *platformv1
 		return false
 	case IngressModeVirtualService:
 		return r.ensureVirtualService(ctx, app, conditions)
+	case IngressModeIngress:
+		return r.ensureV1Ingress(ctx, app, conditions)
 	default:
 		return r.ensureHTTPRoute(ctx, app, conditions)
 	}
+}
+
+func (r *WorkerAppReconciler) ensureV1Ingress(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
+	ingress := buildIngress(app, r.IngressClassName, r.ClusterIssuer)
+	err := r.ensureObject(ctx, app, ingress, func(live, desired client.Object) {
+		l, d := live.(*networkingv1.Ingress), desired.(*networkingv1.Ingress)
+		l.Spec = d.Spec
+		// Annotations carry the route policy; merge so other controllers'
+		// bookkeeping survives.
+		l.SetAnnotations(mergeStringMaps(l.GetAnnotations(), d.GetAnnotations()))
+	})
+	if err != nil {
+		*conditions = append(*conditions, metav1.Condition{
+			Type: condIngressReady, Status: metav1.ConditionFalse,
+			Reason: reasonRouteError, Message: err.Error(),
+		})
+		return true
+	}
+	*conditions = append(*conditions, metav1.Condition{
+		Type: condIngressReady, Status: metav1.ConditionTrue, Reason: "IngressReconciled",
+	})
+	return false
 }
 
 func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
@@ -280,7 +316,7 @@ func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *pla
 	default:
 		*conditions = append(*conditions, metav1.Condition{
 			Type: condIngressReady, Status: metav1.ConditionFalse,
-			Reason: "RouteError", Message: err.Error(),
+			Reason: reasonRouteError, Message: err.Error(),
 		})
 		return true
 	}
@@ -318,7 +354,7 @@ func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platform
 	default:
 		*conditions = append(*conditions, metav1.Condition{
 			Type: condIngressReady, Status: metav1.ConditionFalse,
-			Reason: "RouteError", Message: err.Error(),
+			Reason: reasonRouteError, Message: err.Error(),
 		})
 		return true
 	}

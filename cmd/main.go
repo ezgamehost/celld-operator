@@ -91,7 +91,13 @@ func main() {
 	var ingressMode, istioGateways string
 	var statePollInterval time.Duration
 	flag.StringVar(&ingressMode, "ingress-mode", controller.IngressModeHTTPRoute,
-		"How WorkerApp hostnames are routed: httproute (Gateway API), virtualservice (classic Istio), or none.")
+		"How WorkerApp hostnames are routed: httproute (Gateway API), virtualservice (classic Istio), "+
+			"ingress (networking.k8s.io/v1), or none.")
+	var ingressClass, clusterIssuer string
+	flag.StringVar(&ingressClass, "ingress-class", "",
+		"IngressClass for ingress mode; empty uses the cluster default.")
+	flag.StringVar(&clusterIssuer, "cluster-issuer", "",
+		"cert-manager ClusterIssuer for ingress mode; when set, emitted Ingresses request per-app TLS.")
 	flag.StringVar(&istioGateways, "istio-gateways", "",
 		"Comma-separated pre-existing networking.istio.io Gateways (namespace/name) "+
 			"that VirtualServices bind to in virtualservice mode.")
@@ -224,6 +230,8 @@ func main() {
 		State:             stateClient,
 		IngressMode:       ingressMode,
 		IstioGateways:     istioGatewayList,
+		IngressClassName:  ingressClass,
+		ClusterIssuer:     clusterIssuer,
 		GatewayName:       gatewayName,
 		GatewayNamespace:  gatewayNamespace,
 		PrometheusURL:     prometheusURL,
