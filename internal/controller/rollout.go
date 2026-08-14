@@ -131,6 +131,29 @@ func autoscalingEnabled(app *platformv1alpha1.WorkerApp) bool {
 	return app.Spec.Autoscaling != nil && app.Spec.Autoscaling.Enabled
 }
 
+// updateFleet writes the StatefulSet. A conflict is a normal race with the
+// StatefulSet controller or the HPA, not an error: report it so the caller
+// requeues shortly and re-decides from a fresh read.
+func (r *WorkerAppReconciler) updateFleet(ctx context.Context, sts *appsv1.StatefulSet) (conflict bool, err error) {
+	err = r.Update(ctx, sts)
+	if apierrors.IsConflict(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func conflictOutcome(app *platformv1alpha1.WorkerApp) fleetOutcome {
+	phase := app.Status.Phase
+	if phase == "" {
+		phase = platformv1alpha1.PhasePending
+	}
+	return fleetOutcome{
+		Phase:     phase,
+		WaitingOn: "statefulset write conflicted; retrying",
+		Requeue:   3 * time.Second,
+	}
+}
+
 // configHash digests every Secret the pod template references, so a
 // rotation changes the template and triggers a gated rollout. A missing
 // Secret hashes as a distinct marker: its later creation also rolls the
@@ -184,8 +207,10 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 		return fleetOutcome{}, err
 	}
 
+	// Uncached read: every decision below (template change? partition
+	// position?) must see the present, not the informer's recent past.
 	var existing appsv1.StatefulSet
-	err = r.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: fleetName(app)}, &existing)
+	err = r.Reader.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: fleetName(app)}, &existing)
 	if apierrors.IsNotFound(err) {
 		// Fresh fleet: no gating — pods come up ordered, and there is
 		// nothing warm to protect yet.
@@ -226,8 +251,10 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 		}
 		existing.Annotations[templateHashAnnotation] = desiredHash
 		setStsPartition(&existing, liveReplicas)
-		if err := r.Update(ctx, &existing); err != nil {
+		if conflict, err := r.updateFleet(ctx, &existing); err != nil {
 			return fleetOutcome{}, err
+		} else if conflict {
+			return conflictOutcome(app), nil
 		}
 		return fleetOutcome{
 			Phase:     platformv1alpha1.PhaseRollingOut,
@@ -243,8 +270,10 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 	// Steady state. Scale is ours only when KEDA does not own it.
 	if !autoscalingEnabled(app) && ptr.Deref(existing.Spec.Replicas, 0) != desiredReplicas(app) {
 		existing.Spec.Replicas = ptr.To(desiredReplicas(app))
-		if err := r.Update(ctx, &existing); err != nil {
+		if conflict, err := r.updateFleet(ctx, &existing); err != nil {
 			return fleetOutcome{}, err
+		} else if conflict {
+			return conflictOutcome(app), nil
 		}
 		return fleetOutcome{Phase: platformv1alpha1.PhasePending, Requeue: 10 * time.Second}, nil
 	}
@@ -272,8 +301,10 @@ func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1al
 	if partition > liveReplicas {
 		partition = liveReplicas
 		setStsPartition(sts, partition)
-		if err := r.Update(ctx, sts); err != nil {
+		if conflict, err := r.updateFleet(ctx, sts); err != nil {
 			return fleetOutcome{}, err
+		} else if conflict {
+			return conflictOutcome(app), nil
 		}
 	}
 	out := fleetOutcome{Phase: platformv1alpha1.PhaseRollingOut, Partition: partition, Requeue: 10 * time.Second}
@@ -338,8 +369,10 @@ func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1al
 	// Both gates pass: release the next ordinal.
 	partition--
 	setStsPartition(sts, partition)
-	if err := r.Update(ctx, sts); err != nil {
+	if conflict, err := r.updateFleet(ctx, sts); err != nil {
 		return fleetOutcome{}, err
+	} else if conflict {
+		return conflictOutcome(app), nil
 	}
 	out.Partition = partition
 	if partition == 0 {
@@ -359,8 +392,10 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 	// Phase A: scale the OLD template to zero and let every node drain.
 	if ptr.Deref(existing.Spec.Replicas, 0) != 0 {
 		existing.Spec.Replicas = ptr.To(int32(0))
-		if err := r.Update(ctx, existing); err != nil {
+		if conflict, err := r.updateFleet(ctx, existing); err != nil {
 			return fleetOutcome{}, err
+		} else if conflict {
+			return conflictOutcome(app), nil
 		}
 		out.WaitingOn = "scaling to zero for non-rolling celld upgrade"
 		return out, nil
@@ -378,8 +413,10 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 	existing.Annotations[templateHashAnnotation] = desired.Annotations[templateHashAnnotation]
 	existing.Spec.Replicas = ptr.To(desiredReplicas(app))
 	setStsPartition(existing, 0)
-	if err := r.Update(ctx, existing); err != nil {
+	if conflict, err := r.updateFleet(ctx, existing); err != nil {
 		return fleetOutcome{}, err
+	} else if conflict {
+		return conflictOutcome(app), nil
 	}
 	out.WaitingOn = "starting new fleet"
 	return out, nil

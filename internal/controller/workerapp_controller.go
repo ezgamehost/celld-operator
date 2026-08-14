@@ -69,6 +69,12 @@ type WorkerAppReconciler struct {
 	Scheme *runtime.Scheme
 	State  *StateClient
 
+	// Reader reads uncached. The rollout state machine's StatefulSet reads
+	// go through it: a stale informer view mid-rollout re-enters the
+	// template-change branch and resets partition progress (observed live),
+	// and stale resourceVersions turn every update into a conflict.
+	Reader client.Reader
+
 	// IngressMode selects how hostnames are routed: httproute (default),
 	// virtualservice, or none.
 	IngressMode string
@@ -508,6 +514,9 @@ func boolToCondition(b bool) metav1.ConditionStatus {
 func (r *WorkerAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.State == nil {
 		r.State = NewStateClient()
+	}
+	if r.Reader == nil {
+		r.Reader = mgr.GetAPIReader()
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.WorkerApp{}).

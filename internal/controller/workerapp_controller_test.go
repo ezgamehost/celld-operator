@@ -63,6 +63,7 @@ var _ = Describe("WorkerApp Controller", func() {
 				Client:            k8sClient,
 				Scheme:            k8sClient.Scheme(),
 				State:             NewStateClient(),
+				Reader:            k8sClient,
 				GatewayName:       "edge",
 				GatewayNamespace:  "infra",
 				PrometheusURL:     "http://prometheus.test:9090",
