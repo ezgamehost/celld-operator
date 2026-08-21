@@ -53,12 +53,14 @@ under your operation), not for anonymous hostile code.
 - **A qualified object store.** celld's ownership fencing requires atomically
   enforced conditional writes (`If-None-Match: *`, `If-Match`) and
   read-after-write consistency. Qualified: Amazon S3, Cloudflare R2, Google
-  Cloud Storage, Tigris. Not qualified: MinIO community edition, Backblaze B2,
-  DigitalOcean Spaces, Hetzner. celld speaks only the S3 and GCS dialects, so a
-  store without an S3-compatible API (Azure Blob among them) cannot back a
-  fleet at all. For anything else, run
-  [store qualification](#store-qualification) first — an unenforced condition
-  silently splits cell ownership.
+  Cloud Storage, Tigris, Azure Blob Storage (celld 0.3+). Not qualified: MinIO
+  community edition, Backblaze B2, DigitalOcean Spaces, Hetzner, Azurite.
+  celld speaks only the S3, GCS and Azure Blob dialects (`s3://`, `gs://`,
+  `az://`), so a store without one of those APIs cannot back a fleet at all.
+  For anything else, run [store qualification](#store-qualification) first —
+  an unenforced condition silently splits cell ownership. Every node also
+  probes the store's conditional writes at startup and refuses to serve if
+  they fail.
 - Optional, each degrading gracefully to a status condition when absent:
   - **Gateway API** CRDs + an implementation (Istio recommended) for hostname
     ingress.
@@ -122,15 +124,20 @@ spec:
   hostnames: ["chat.acme.example.com"]   # routed via the shared Gateway
   appVersion: sha-abc123                 # which bucket deployment is live
   celld:
-    image: ghcr.io/denoland/celld:v0.2.0
-    updateStrategy: Rolling              # Recreate for non-rolling celld upgrades
+    image: ghcr.io/denoland/celld:v0.3.0
+    updateStrategy: Rolling              # Recreate for non-rolling celld version changes
   replicas: 3
   bucket:
-    name: s3://platform-cells/apps/chat  # bucket + per-app prefix
+    name: s3://platform-cells/apps/chat  # bucket + per-app prefix (s3://, gs://, or az://)
     endpoint: https://ACCOUNT.r2.cloudflarestorage.com
     region: auto
     credentialsFrom:
       iamRole: arn:aws:iam::123456789012:role/celld-chat   # IRSA; or secretRef
+  # bucket:                              # Azure Blob Storage: the name is the container,
+  #   name: az://platform-cells/apps/chat
+  #   storageAccount: platformcells      # the account is separate (AZURE_STORAGE_ACCOUNT_NAME),
+  #   credentialsFrom:
+  #     azureClientID: 11111111-2222-3333-4444-555555555555   # AKS workload identity; or secretRef
   resources:
     memoryGi: 8                          # ~1000 resident cells per 8 GiB
     maxResidentCells: 1000
@@ -140,6 +147,8 @@ spec:
   #   type: ClusterIP                    # hostnames at all — consumers use <app>-celld.<ns>.svc:8080
   #   annotations: {}                    # or LoadBalancer + annotations for a private LB
   websockets: true                       # long idle timeouts, sticky-friendly, slow scale-down
+  # durability: fleet                    # celld's default since 0.3; "bucket" waits for the upload before acking
+  # trustForwardedHeaders: true          # request.url from X-Forwarded-*; only behind a proxy that replaces both
   autoscaling:
     enabled: true
     minReplicas: 3
@@ -184,8 +193,14 @@ warning when the bucket pointer and the CR disagree (nodes always load the
 bucket's version) — but only for fleets using `secretRef` credentials; the
 operator does not read the bucket for `iamRole` fleets. Tracking reads use the
 fleet's `secretRef` credentials, or the operator's ambient AWS identity
-otherwise, and support `s3://` buckets only: a `gs://` fleet must pin
-`appVersion`.
+otherwise, and support `s3://` buckets only: a `gs://` or `az://` fleet must
+pin `appVersion` (`DeployTrackingReady: UnsupportedStore` says so).
+
+A deployment can also need a newer celld than the fleet runs: the manifest
+names the features it uses (static assets, Wasm, and since celld 0.3 cron
+triggers, D1, sqlite-vec), and an older node rejects it at startup. That
+surfaces as the first released pod never becoming Ready, which holds the
+rollout there. Bump `spec.celld.image` first, then deploy.
 
 The operator then runs a **gated rolling update**, not a vanilla one. celld's
 documented rule is: after restarting a node, wait until *every* node reports
@@ -199,12 +214,25 @@ and is Ready, and (b) a live sweep of every pod's `/state` shows fleet-wide
 ### celld version upgrades
 
 Bumping `spec.celld.image` rolls the same way — except across boundaries that
-upstream flags as **not rolling-safe** (v0.1 ↔ v0.2: mixed fleets break).
-Those are refused with `phase: Degraded` unless the CR explicitly sets
+upstream flags as **not rolling-safe**. Those are refused with
+`phase: Degraded` and the upstream reason unless the CR explicitly sets
 `celld.updateStrategy: Recreate`, which scales the fleet to zero, waits for
 every node to drain, then starts the new version. That is an availability
-event by design; the CR has to ask for it. Note celld ships security fixes
+event by design; the CR has to ask for it. A jump that skips releases is
+checked against every boundary in between. Note celld ships security fixes
 for its latest release only — plan to track head.
+
+| Change | Rolling? | Why |
+| --- | --- | --- |
+| v0.1 ↔ v0.2 | No, either direction | Mixed fleets break: ownership records changed address semantics and block objects changed format |
+| v0.2.1 → v0.3.0 | **Yes** | A v0.3 node that cannot replicate to a v0.2 peer falls back to bucket proofs until the peer upgrades |
+| v0.3 → v0.2 | No | A v0.2 binary cannot read writes still waiting in v0.3's replicated log or bundle objects, so the downgrade can lose acknowledged writes. `Recreate` drains every node first, which seals each log (`node-log close: sealed epoch` in the shutdown log); check for that line before trusting the downgrade |
+
+celld 0.3 also changed the default write-acknowledgement proof from `bucket`
+to `fleet` (two follower nodes hold the write on disk, the bucket upload
+trails): a rolling upgrade switches each node as it restarts, and
+`spec.durability: bucket` pins the old behavior if you want write latency
+and durability to keep depending on the bucket alone.
 
 ## Autoscaling
 
@@ -218,6 +246,8 @@ celld has no metrics endpoint yet, so the operator polls each pod's internal
 | `celld_restoring` | Cold activations in flight |
 | `celld_evicting` | Cells being evicted |
 | `celld_shedding` | 1 while pressure-shedding — the hard out-of-capacity signal |
+| `celld_rss_bytes` / `celld_in_use_bytes` | Process RSS and the memory the cells hold (celld 0.3+); the gap is allocator retention shedding cannot return |
+| `celld_container_restarts` / `celld_self_fenced` | Kubelet restart count, and 1 if the last exit was a celld self-fence (exit code 3) — a fence loop means the store or the bucket credential is broken |
 | `celld_state_up` | 1 if `/state` answered the last poll |
 
 With `spec.autoscaling.enabled`, the operator materializes a KEDA
@@ -236,10 +266,23 @@ them wrong via templates because there are no templates:
 - **Liveness is TCP-only.** celld's health path answers 503 during a graceful
   drain; an HTTP liveness probe there would kill nodes mid-handoff.
 - **Termination grace (40s) exceeds the drain bound** (`CELLD_SHUTDOWN_DRAIN_MS`,
-  25s), so the kubelet never SIGKILLs a draining node.
+  25s), so the kubelet never SIGKILLs a draining node, and the node-log seal
+  that follows the drain gets its headroom.
 - **`CELLD_MAX_RSS_MB` is set explicitly** to ~80% of the container memory
   limit, so the ceiling is visible in the pod spec rather than inferred (celld
-  derives the same 80% from the cgroup limit on its own).
+  derives the same 80% from the cgroup limit on its own). celld applies it to
+  the memory the cells hold and keeps its own absolute cap at 95% of the limit
+  on the process RSS; 80% stays under that cap, so shedding can still recover
+  the node.
+- **Fleet pods spread across hosts** (soft hostname topology spread). With
+  celld 0.3's fleet durability an acknowledged write lives on two follower
+  disks until the bucket upload lands; co-located followers would make one
+  host failure lose it.
+- **Self-fenced nodes come back.** celld exits with code 3 after a
+  `SELF-FENCE:` and requires a supervisor that restarts it without limit,
+  spacing attempts by at least one lease lifetime (10s); the kubelet's
+  restart policy and CrashLoopBackOff do exactly that, and
+  `celld_self_fenced` makes a fence loop visible.
 - **The internal listener stays internal.** `:8081` (peer protocol plus an
   *unauthenticated* operator API) is reachable only from fleet pods and the
   operator's namespace via NetworkPolicy, reinforced by an Istio
@@ -262,6 +305,7 @@ them wrong via templates because there are no templates:
 | --- | --- |
 | `Available` / `Progressing` / `Degraded` | Standard phase reflection; `Degraded` message names the refusal (e.g. a breaking upgrade without Recreate) |
 | `BucketCredentialsReady` | `iamRole: auto` provisioning is not implemented yet — annotate the fleet ServiceAccount yourself |
+| `DeployTrackingReady` | `appVersion: auto` cannot follow the bucket: unreachable (holding the last known version), or an `UnsupportedStore` (`gs://`/`az://` — pin `appVersion`); in pinned mode, `VersionMismatch` when the bucket pointer disagrees with the CR |
 | `IngressReady` | Gateway API CRDs missing, or route error — hostnames are not routed |
 | `MeshPolicyReady` | Istio absent — NetworkPolicy alone guards `:8081` |
 | `AutoscalingReady` | KEDA absent — `spec.autoscaling` has no effect |
@@ -289,29 +333,42 @@ which fails *silently*, as two nodes owning one cell. Before trusting a store
 that is not on the qualified list (and after every store upgrade):
 
 ```sh
-# 1. celld's own sequential contract test (from the celld repo):
-CELLD_CAS_LIVE=1 CELLD_CAS_BUCKET=<bucket> CELLD_CAS_ENDPOINT=<url> \
-  cargo test -p celld put_cas_contract -- --nocapture
+# 1. celld's own sequential contract test: create, reject-create, update,
+#    reject-stale, against the real bucket (any of s3://, gs://, az://).
+#    Every node repeats it at startup (CELLD_STORAGE_PROBE) and refuses to
+#    serve if it fails.
+celld diagnose --bucket <bucket> [--endpoint <url>] [--region <region>]
 
-# 2. This repo's concurrency hammer — N racers, exactly one winner per round:
+# 2. This repo's concurrency hammer — N racers, exactly one winner per round
+#    (S3 API only):
 go run ./hack/cas-hammer --bucket <bucket> --endpoint <url> \
   --writers 8 --rounds 32
 ```
 
 Exit 1 from the hammer means the store cannot fence celld cells. Do not run a
-fleet on it.
+fleet on it. Both tests write: the probe uses the reserved `probe/` prefix,
+the hammer its own `--prefix`.
 
 ## Security notes
 
-- **Bucket credentials are fleet-admin authority.** Scope one IAM role per
-  fleet to that fleet's prefix and nothing else; prefer IRSA/workload
-  identity over static keys (`credentialsFrom.secretRef` exists for stores
-  without role auth).
+- **Bucket credentials are fleet-admin authority.** Scope one IAM role
+  (or Azure identity) per fleet to that fleet's prefix and nothing else;
+  prefer IRSA / AKS workload identity over static keys
+  (`credentialsFrom.secretRef` exists for stores without identity auth).
+  The credential needs put and delete under the prefix: celld's startup
+  probe writes and removes one object under `probe/`.
 - celld terminates no TLS anywhere: public TLS belongs to the Gateway, and
   the pod network should be encrypted (Istio ambient, or a CNI with
   WireGuard) because the peer protocol relies on network confidentiality.
 - The deployed Worker owns every public path except `/__celld/health`;
-  application authentication is the application's job.
+  application authentication is the application's job. celld ignores
+  `X-Forwarded-Host` / `X-Forwarded-Proto` unless
+  `spec.trustForwardedHeaders` is set — turn it on only when every hop in
+  front of the fleet replaces both headers.
+- The internal listener's `/cell/` and `/do/` routes run application code
+  unauthenticated; only the D1 route (`/__d1/`, what `celld d1` uses)
+  authenticates with the fleet secret. Keep `:8081` behind the operator's
+  policies.
 
 ## Development
 

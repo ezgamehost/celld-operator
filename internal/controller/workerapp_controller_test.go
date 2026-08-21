@@ -35,7 +35,9 @@ import (
 )
 
 const (
-	testCelldImage    = "ghcr.io/denoland/celld:v0.2.0"
+	testCelldImage = "ghcr.io/denoland/celld:v0.3.0"
+	// A v0.1 image: moving from it to testCelldImage crosses the flagged
+	// v0.1/v0.2 boundary (docs/celld-behaviors.md F8).
 	testCelldImageOld = "ghcr.io/denoland/celld:v0.1.0"
 )
 
@@ -139,9 +141,21 @@ var _ = Describe("WorkerApp Controller", func() {
 				env[e.Name] = e.Value
 			}
 			Expect(env).To(HaveKeyWithValue("CELLD_BUCKET", "s3://test-cells/apps/test"))
-			// Explicit RSS bound ≈80% of the 8Gi default limit.
+			// Explicit shed threshold ≈80% of the 8Gi default limit, under
+			// celld's own 95% RSS cap (F10).
 			Expect(env).To(HaveKeyWithValue("CELLD_MAX_RSS_MB", "6553"))
 			Expect(env["CELLD_ADVERTISE"]).To(ContainSubstring("test-resource-celld-internal"))
+			// Unset durability and forwarded-header trust leave celld's
+			// defaults alone rather than pinning them.
+			Expect(env).NotTo(HaveKey("CELLD_DURABILITY"))
+			Expect(env).NotTo(HaveKey("CELLD_TRUST_FORWARDED_HEADERS"))
+			// Fleet durability keeps acknowledged writes on follower disks
+			// until tiered (F13): spread the pods across hosts, softly.
+			spread := sts.Spec.Template.Spec.TopologySpreadConstraints
+			Expect(spread).To(HaveLen(1))
+			Expect(spread[0].TopologyKey).To(Equal("kubernetes.io/hostname"))
+			Expect(spread[0].WhenUnsatisfiable).To(Equal(corev1.ScheduleAnyway))
+			Expect(sts.Spec.Template.Labels).NotTo(HaveKey(azureWorkloadIdentityUseLabel))
 
 			By("creating both Services, the NetworkPolicy, and the PDB")
 			svc := &corev1.Service{}
@@ -262,16 +276,101 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(appVersionAnnotation, "sha-test"))
 		})
 
+		It("should render an Azure Blob fleet and pin durability and forwarded-header trust", func() {
+			By("pointing the fleet at an az:// container with AKS workload identity")
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Bucket = platformv1alpha1.BucketSpec{
+				Name:           "az://test-cells/apps/test",
+				StorageAccount: "platformcells",
+				CredentialsFrom: platformv1alpha1.BucketCredentials{
+					AzureClientID: "11111111-2222-3333-4444-555555555555",
+				},
+			}
+			resource.Spec.Durability = platformv1alpha1.DurabilityBucket
+			resource.Spec.TrustForwardedHeaders = true
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("rendering celld's Azure environment, the identity wiring, and the pinned settings")
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			container := sts.Spec.Template.Spec.Containers[0]
+			env := map[string]string{}
+			for _, e := range container.Env {
+				env[e.Name] = e.Value
+			}
+			Expect(env).To(HaveKeyWithValue("CELLD_BUCKET", "az://test-cells/apps/test"))
+			Expect(env).To(HaveKeyWithValue("AZURE_STORAGE_ACCOUNT_NAME", "platformcells"))
+			Expect(env).NotTo(HaveKey("S3_ENDPOINT"))
+			Expect(env).To(HaveKeyWithValue("CELLD_DURABILITY", "bucket"))
+			Expect(env).To(HaveKeyWithValue("CELLD_TRUST_FORWARDED_HEADERS", "1"))
+			// The AKS webhook mutates pods carrying the use label whose
+			// ServiceAccount names the client ID.
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(azureWorkloadIdentityUseLabel, "true"))
+			Expect(sts.Spec.Selector.MatchLabels).NotTo(HaveKey(azureWorkloadIdentityUseLabel))
+			sa := &corev1.ServiceAccount{}
+			Expect(k8sClient.Get(ctx, fleetKey, sa)).To(Succeed())
+			Expect(sa.Annotations).To(HaveKeyWithValue(azureClientIDAnnotation, "11111111-2222-3333-4444-555555555555"))
+			Expect(sa.Annotations).NotTo(HaveKey("eks.amazonaws.com/role-arn"))
+
+			By("refusing appVersion auto, which reads the pointer over the S3 API only")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.AppVersion = AppVersionAuto
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			updated := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			cond := meta.FindStatusCondition(updated.Status.Conditions, condDeployTrackingReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Reason).To(Equal("UnsupportedStore"))
+			// And the fleet keeps the version it was serving.
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(appVersionAnnotation, "sha-test"))
+		})
+
+		It("should reject bucket specs celld would refuse at startup", func() {
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+
+			By("an az:// container without its storage account")
+			resource.Spec.Bucket = platformv1alpha1.BucketSpec{Name: "az://test-cells/apps/test"}
+			err := k8sClient.Update(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("storageAccount"))
+
+			By("an S3 endpoint on a gs:// bucket")
+			resource.Spec.Bucket = platformv1alpha1.BucketSpec{
+				Name:     "gs://test-cells/apps/test",
+				Endpoint: "https://example.invalid",
+			}
+			err = k8sClient.Update(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("endpoint"))
+
+			By("a scheme celld does not speak")
+			resource.Spec.Bucket = platformv1alpha1.BucketSpec{Name: "abfs://test-cells/apps/test"}
+			err = k8sClient.Update(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+		})
+
 		It("should refuse a rolling update across a breaking celld boundary", func() {
 			r := reconciler()
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("bumping the celld image across the v0.1 -> v0.2 boundary shape")
+			By("bumping the celld image from v0.1 to v0.3, which crosses the flagged v0.1/v0.2 boundary")
 			resource := &platformv1alpha1.WorkerApp{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			// Seed the live StatefulSet with a v0.1 image so the transition
-			// to the spec's v0.2 image crosses the flagged boundary.
+			// to the spec's v0.3 image crosses the flagged boundary.
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
 			sts.Spec.Template.Spec.Containers[0].Image = testCelldImageOld
@@ -287,10 +386,46 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseDegraded))
 			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("not rolling-safe"))
+			// The refusal names the upstream hazard, not just the fact.
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring(reasonMixedFleet))
 
 			By("confirming the fleet was not touched")
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImageOld))
+		})
+
+		It("should refuse a rolling downgrade from v0.3 to v0.2 and surface the hazard on Recreate", func() {
+			r := reconciler()
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("asking for a v0.2 image on a fleet running v0.3")
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Celld.Image = testCelldImageV021
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			updated := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseDegraded))
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("sealed epoch"))
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImage))
+
+			By("proceeding only once the CR says Recreate, and saying what the stop protects")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Celld.UpdateStrategy = platformv1alpha1.UpdateStrategyRecreate
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
+			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseRecreating))
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("sealed epoch"))
+			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
+			Expect(*sts.Spec.Replicas).To(BeZero())
 		})
 	})
 })
