@@ -9,19 +9,27 @@ spec:
   hostnames: ["chat.acme.ezghcloud.com"]
   appVersion: sha-abc123
   celld:
-    image: ghcr.io/denoland/celld:v0.2.0
+    image: ghcr.io/denoland/celld:v0.3.0
     updateStrategy: Rolling
   replicas: 3
   bucket:
     name: s3://platform-cells/apps/chat
     credentialsFrom:
       iamRole: auto
+    # Azure Blob Storage instead: the name is the container, the account
+    # is separate, and AKS workload identity replaces the IAM role.
+    # name: az://platform-cells/apps/chat
+    # storageAccount: platformcells
+    # credentialsFrom:
+    #   azureClientID: 11111111-2222-3333-4444-555555555555
   resources:
     memoryGi: 8
     maxResidentCells: 1000
   vars:
     secretRef: chat-vars
   websockets: true
+  # durability: fleet           # celld's default; "bucket" waits for the upload before acking
+  # trustForwardedHeaders: true # only behind a proxy that replaces X-Forwarded-Host and -Proto
   autoscaling:
     enabled: true
     minReplicas: 3

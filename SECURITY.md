@@ -25,10 +25,12 @@ exposure:
   prefix, and rotate on suspicion of disclosure. The operator reads these
   credentials (for config-hash rotation tracking and deploy-pointer
   tracking) but never logs or re-exports them.
-- **celld's internal listener (:8081) is unauthenticated upstream.** The
-  operator fences it with NetworkPolicy and (where Istio is present)
-  AuthorizationPolicy; weakening either is equivalent to granting cell
-  eviction and shutdown rights to whatever can reach the pod network.
+- **celld's internal listener (:8081) is unauthenticated upstream** (only
+  the D1 SQL route checks the fleet secret; `/cell/` and `/do/` run
+  application code for any caller). The operator fences it with
+  NetworkPolicy and (where Istio is present) AuthorizationPolicy; weakening
+  either is equivalent to granting cell activation, eviction and shutdown
+  rights to whatever can reach the pod network.
 - celld itself is not safe for hostile multi-tenant use; the isolation
   model is fleet-per-application. See
   [docs/celld-behaviors.md](docs/celld-behaviors.md) (F3) before hosting
