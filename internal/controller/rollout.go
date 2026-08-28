@@ -104,6 +104,7 @@ type fleetOutcome struct {
 }
 
 func minorOf(image string) (minorVersion, bool) {
+	image, _, _ = strings.Cut(image, "@")
 	idx := strings.LastIndex(image, ":")
 	if idx < 0 {
 		return minorVersion{}, false

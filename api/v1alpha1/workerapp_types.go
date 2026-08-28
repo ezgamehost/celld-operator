@@ -105,7 +105,9 @@ type BucketSpec struct {
 	// container (AZURE_STORAGE_ACCOUNT_NAME). Required for az://, ignored
 	// otherwise.
 	// +optional
-	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=24
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]+$`
 	StorageAccount string `json:"storageAccount,omitempty"`
 
 	// region is the storage region, when it cannot be inferred.

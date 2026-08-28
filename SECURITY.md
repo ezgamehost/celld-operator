@@ -28,9 +28,10 @@ exposure:
 - **celld's internal listener (:8081) is unauthenticated upstream** (only
   the D1 SQL route checks the fleet secret; `/cell/` and `/do/` run
   application code for any caller). The operator fences it with
-  NetworkPolicy and (where Istio is present) AuthorizationPolicy; weakening
-  either is equivalent to granting cell activation, eviction and shutdown
-  rights to whatever can reach the pod network.
+  NetworkPolicy and (where Istio is present) AuthorizationPolicy. Cell
+  activation, eviction and shutdown rights are available only to callers
+  that pass every effective policy layer, or to any caller that can reach
+  the pod network when both policy controls are removed.
 - celld itself is not safe for hostile multi-tenant use; the isolation
   model is fleet-per-application. See
   [docs/celld-behaviors.md](docs/celld-behaviors.md) (F3) before hosting

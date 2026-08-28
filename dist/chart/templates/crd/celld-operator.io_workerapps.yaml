@@ -174,7 +174,9 @@ spec:
                       storageAccount is the Azure storage account that holds an az://
                       container (AZURE_STORAGE_ACCOUNT_NAME). Required for az://, ignored
                       otherwise.
-                    maxLength: 64
+                    maxLength: 24
+                    minLength: 3
+                    pattern: ^[a-z0-9]+$
                     type: string
                 required:
                 - name

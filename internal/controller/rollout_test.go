@@ -57,6 +57,7 @@ func TestIsBreakingUpgrade(t *testing.T) {
 		{"unparseable tags are not refused", "ghcr.io/denoland/celld:latest", v03, false, ""},
 		{"a tag without a minor is not refused", "ghcr.io/denoland/celld:v1", v03, false, ""},
 		{"registry with a port still parses the tag", "registry:5000/celld:v0.1.0", "registry:5000/celld:v0.2.0", true, reasonMixedFleet},
+		{"a tag with a digest suffix parses before the digest", "registry:5000/celld:v0.1.0@sha256:7c222fb2927d828af22f592134e8932480637c0d7f076771e81cf2acd7204ecf", "registry:5000/celld:v0.2.0", true, reasonMixedFleet},
 		{"a future minor with no flagged boundary", v03, "ghcr.io/denoland/celld:v0.4.0", false, ""},
 	}
 	for _, tc := range cases {
