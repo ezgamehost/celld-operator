@@ -94,7 +94,9 @@ jobs:
         id: semantic
         uses: cycjimmy/semantic-release-action@v4
         with:
-          extra_plugins: conventional-changelog-conventionalcommits
+          # semantic-release 24 bundles conventional-changelog-writer 8.
+          # Preset 9 requires writer 9 and fails while generating notes.
+          extra_plugins: conventional-changelog-conventionalcommits@8.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
