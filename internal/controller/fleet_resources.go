@@ -60,11 +60,14 @@ const (
 
 	publicPort   = 8080
 	internalPort = 8081
+	healthPath   = "/.well-known/celld/health"
 
-	// celld's default drain bound; terminationGracePeriodSeconds must exceed
-	// it so the orchestrator never SIGKILLs a draining node (docs/celld-behaviors.md F6).
+	// v0.4 bounds the complete process stop separately from the handoff
+	// no-progress interval. Pin that bound and leave Kubernetes enough
+	// headroom to finish celld's local durability shutdown.
 	shutdownDrainMs   = 25000
-	terminationGraceS = 40
+	shutdownTotalMs   = 40000
+	terminationGraceS = 60
 
 	watchDir = "/var/lib/celld"
 	varsDir  = "/etc/celld/vars"
@@ -162,6 +165,7 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 			internalServiceName(app), app.Namespace, internalPort)},
 		{Name: "CELLD_WATCH", Value: watchDir},
 		{Name: "CELLD_SHUTDOWN_DRAIN_MS", Value: fmt.Sprintf("%d", shutdownDrainMs)},
+		{Name: "CELLD_SHUTDOWN_TOTAL_MS", Value: fmt.Sprintf("%d", shutdownTotalMs)},
 		{Name: "CELLD_MAX_RESIDENT_CELLS", Value: fmt.Sprintf("%d", maxResidentCells(app))},
 		{Name: "CELLD_MAX_RSS_MB", Value: fmt.Sprintf("%d", rssMb)},
 	}
@@ -247,12 +251,12 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 			{Name: "public", ContainerPort: publicPort},
 			{Name: "internal", ContainerPort: internalPort},
 		},
-		// Readiness on celld's health path: it answers 503 during a drain,
-		// which pulls the pod from EndpointSlices — the built-in drain
-		// signal (F6).
+		// Readiness uses v0.4's reserved health path. It answers 503 during
+		// a drain, which pulls the pod from EndpointSlices — the built-in
+		// drain signal (F6).
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
-				Path: "/__celld/health",
+				Path: healthPath,
 				Port: intstr.FromInt32(publicPort),
 			}},
 			PeriodSeconds:    5,

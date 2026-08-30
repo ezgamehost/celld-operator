@@ -9,7 +9,7 @@ spec:
   hostnames: ["chat.acme.ezghcloud.com"]
   appVersion: sha-abc123
   celld:
-    image: ghcr.io/denoland/celld:v0.3.0
+    image: ghcr.io/denoland/celld:v0.4.0
     updateStrategy: Rolling
   replicas: 3
   bucket:

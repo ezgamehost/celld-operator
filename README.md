@@ -124,7 +124,7 @@ spec:
   hostnames: ["chat.acme.example.com"]   # routed via the shared Gateway
   appVersion: sha-abc123                 # which bucket deployment is live
   celld:
-    image: ghcr.io/denoland/celld:v0.3.0
+    image: ghcr.io/denoland/celld:v0.4.0
     updateStrategy: Rolling              # Recreate for non-rolling celld version changes
   replicas: 3
   bucket:
@@ -132,7 +132,7 @@ spec:
     endpoint: https://ACCOUNT.r2.cloudflarestorage.com
     region: auto
     credentialsFrom:
-      iamRole: arn:aws:iam::123456789012:role/celld-chat   # IRSA; or secretRef
+      iamRole: arn:aws:iam::123456789012:role/celld-chat   # IRSA; or secretRef; omit for EKS Pod Identity
   # bucket:                              # Azure Blob Storage: the name is the container,
   #   name: az://platform-cells/apps/chat
   #   storageAccount: platformcells      # the account is separate (AZURE_STORAGE_ACCOUNT_NAME),
@@ -172,44 +172,48 @@ chat   Ready   sha-abc123   3       0           2m
 
 ## Deploying updates
 
-celld nodes load their application deployment from the bucket **at startup
-only**, so publishing a new version serves nothing until the fleet restarts.
-The workflow:
+celld v0.4 polls the bucket's `deploy/current.json` every 30 seconds and
+adopts a new deployment in place. New requests use the new generation while
+requests already running finish on the old one; resident Durable Objects move
+at safe points. `celld deploy` therefore begins serving without a pod restart.
+
+Keep the `WorkerApp`'s expected version in sync as well:
 
 ```sh
 celld deploy . --bucket s3://platform-cells/apps/chat ...   # publish
 kubectl patch workerapp chat -n tenant-acme --type merge \
-  -p '{"spec":{"appVersion":"sha-def456"}}'                  # roll
+  -p '{"spec":{"appVersion":"sha-def456"}}'
 ```
 
-(Or bump `appVersion` in git and let your GitOps tool apply it.)
+(Or bump `appVersion` in git and let your GitOps tool apply it.) The operator
+retains a conservative gated restart when this field changes. v0.4 does not
+need that restart to adopt code, but it gives the CR an explicit convergence
+point and keeps `status.rolledOutAppVersion` tied to the declared deployment.
 
-Prefer `celld deploy` to be the whole story? Set `appVersion: auto` and the
-operator follows the bucket's `deploy/current.json` itself — a new publish
-rolls the fleet within one `--deploy-poll-interval` (default 60s), and
-`status.rolledOutAppVersion` reports the concrete version being served. In
-pinned mode the same read powers a `DeployTrackingReady: VersionMismatch`
-warning when the bucket pointer and the CR disagree (nodes always load the
-bucket's version) — but only for fleets using `secretRef` credentials; the
-operator does not read the bucket for `iamRole` fleets. Tracking reads use the
-fleet's `secretRef` credentials, or the operator's ambient AWS identity
-otherwise, and support `s3://` buckets only: a `gs://` or `az://` fleet must
-pin `appVersion` (`DeployTrackingReady: UnsupportedStore` says so).
+Prefer `celld deploy` to be the whole story? Set `appVersion: auto`. The
+operator follows the bucket's `deploy/current.json`; a new publish updates the
+expected version within one `--deploy-poll-interval` (default 60s), while celld
+itself normally adopts within 30s. In pinned mode the same read powers a
+`DeployTrackingReady: VersionMismatch` warning when the bucket pointer and the
+CR disagree — but only for fleets using `secretRef` credentials; the operator
+does not read the bucket for `iamRole` fleets. Tracking reads use the fleet's
+`secretRef` credentials, or the operator's ambient AWS identity otherwise,
+and support `s3://` buckets only: a `gs://` or `az://` fleet must pin
+`appVersion` (`DeployTrackingReady: UnsupportedStore` says so).
 
 A deployment can also need a newer celld than the fleet runs: the manifest
-names the features it uses (static assets, Wasm, and since celld 0.3 cron
-triggers, D1, sqlite-vec), and an older node rejects it at startup. That
-surfaces as the first released pod never becoming Ready, which holds the
-rollout there. Bump `spec.celld.image` first, then deploy.
+names the features it uses. v0.4 adds Workers KV, Queues, Workflows, and R2
+bindings to the existing static-assets, Wasm, cron, D1, and sqlite-vec
+surface. Upgrade `spec.celld.image` before publishing a deployment that needs
+the new runtime.
 
-The operator then runs a **gated rolling update**, not a vanilla one. celld's
-documented rule is: after restarting a node, wait until *every* node reports
-`restoring=0` before restarting the next — and that restore work lands on the
-*peers* that absorbed the drained node's cells, which a stock rolling update
-cannot see. The operator owns the StatefulSet partition, releases one ordinal
-at a time, and steps only when (a) every released pod runs the new revision
-and is Ready, and (b) a live sweep of every pod's `/state` shows fleet-wide
-`restoring=0`. Progress is visible in `status.rollout.waitingOn`.
+Pod-template changes still run a **gated rolling update**, not a vanilla one.
+The operator owns the StatefulSet partition, releases one ordinal at a time,
+and steps only when (a) every released pod runs the new revision and is Ready,
+and (b) a live sweep of every pod's `/state` shows fleet-wide
+`restoring=0`. v0.4 also gates each replacement's first healthy response on
+fleet recovery; the operator's sweep is the conservative fleet-wide backstop.
+Progress is visible in `status.rollout.waitingOn`.
 
 ### celld version upgrades
 
@@ -222,11 +226,17 @@ event by design; the CR has to ask for it. A jump that skips releases is
 checked against every boundary in between. Note celld ships security fixes
 for its latest release only — plan to track head.
 
+v0.4 adds a 40-second complete shutdown bound around drain-token waiting,
+handoff, and local durability shutdown. The operator pins that bound and gives
+the pod 60 seconds of termination grace, so kubelet does not cut the seal with
+SIGKILL.
+
 | Change | Rolling? | Why |
 | --- | --- | --- |
 | v0.1 ↔ v0.2 | No, either direction | Mixed fleets break: ownership records changed address semantics and block objects changed format |
 | v0.2.1 → v0.3.0 | **Yes** | A v0.3 node that cannot replicate to a v0.2 peer falls back to bucket proofs until the peer upgrades |
 | v0.3 → v0.2 | No | A v0.2 binary cannot read writes still waiting in v0.3's replicated log or bundle objects, so the downgrade can lose acknowledged writes. `Recreate` drains every node first, which seals each log (`node-log close: sealed epoch` in the shutdown log); check for that line before trusting the downgrade |
+| v0.3 ↔ v0.4 | No, either direction | v0.4's versioned peer tunnel refuses v0.3 peers, and v0.3 cannot read v0.4's epoch-qualified large Workers KV value references. Use `Recreate`: stop every v0.3 node before starting v0.4 |
 
 celld 0.3 also changed the default write-acknowledgement proof from `bucket`
 to `fleet` (two follower nodes hold the write on disk, the bucket upload
@@ -246,7 +256,8 @@ celld has no metrics endpoint yet, so the operator polls each pod's internal
 | `celld_restoring` | Cold activations in flight |
 | `celld_evicting` | Cells being evicted |
 | `celld_shedding` | 1 while pressure-shedding — the hard out-of-capacity signal |
-| `celld_rss_bytes` / `celld_in_use_bytes` | Process RSS and the memory the cells hold (celld 0.3+); the gap is allocator retention shedding cannot return |
+| `celld_rss_bytes` / `celld_in_use_bytes` | Process RSS and RSS minus allocator retention |
+| `celld_cgroup_working_set_bytes` / `celld_cgroup_current_bytes` | v0.4 active cgroup memory used by pressure shedding, and the complete cgroup charge used by the absolute cap; absent outside a readable Linux cgroup |
 | `celld_container_restarts` / `celld_self_fenced` | Kubelet restart count, and 1 if the last exit was a celld self-fence (exit code 3) — a fence loop means the store or the bucket credential is broken |
 | `celld_state_up` | 1 if `/state` answered the last poll |
 
@@ -351,24 +362,24 @@ the hammer its own `--prefix`.
 
 ## Security notes
 
-- **Bucket credentials are fleet-admin authority.** Scope one IAM role
-  (or Azure identity) per fleet to that fleet's prefix and nothing else;
-  prefer IRSA / AKS workload identity over static keys
-  (`credentialsFrom.secretRef` exists for stores without identity auth).
+- **Bucket credentials are fleet-admin authority.** Scope one AWS role
+  (or Azure identity) per fleet to that fleet's prefix and nothing else.
+  celld v0.4 reads EKS Pod Identity's injected container credentials with no
+  pod-spec changes; IRSA uses `iamRole`. Prefer either over `secretRef`.
   The credential needs put and delete under the prefix: celld's startup
   probe writes and removes one object under `probe/`.
 - celld terminates no TLS anywhere: public TLS belongs to the Gateway, and
   the pod network should be encrypted (Istio ambient, or a CNI with
   WireGuard) because the peer protocol relies on network confidentiality.
-- The deployed Worker owns every public path except `/__celld/health`;
-  application authentication is the application's job. celld ignores
+- The deployed Worker owns every public path except
+  `/.well-known/celld/health`; application authentication is the
+  application's job. celld ignores
   `X-Forwarded-Host` / `X-Forwarded-Proto` unless
   `spec.trustForwardedHeaders` is set — turn it on only when every hop in
   front of the fleet replaces both headers.
 - The internal listener's `/cell/` and `/do/` routes run application code
-  unauthenticated; only the D1 route (`/__d1/`, what `celld d1` uses)
-  authenticates with the fleet secret. Keep `:8081` behind the operator's
-  policies.
+  unauthenticated. Reserved runtime classes use the HMAC-authenticated
+  `/runtime/<SCOPE>` protocol. Keep `:8081` behind the operator's policies.
 
 ## Development
 

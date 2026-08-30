@@ -35,9 +35,9 @@ import (
 )
 
 const (
-	testCelldImage = "ghcr.io/denoland/celld:v0.3.0"
-	// A v0.1 image: moving from it to testCelldImage crosses the flagged
-	// v0.1/v0.2 boundary (docs/celld-behaviors.md F8).
+	testCelldImage = "ghcr.io/denoland/celld:v0.4.0"
+	// A v0.1 image: moving from it to testCelldImage crosses both
+	// stop-all boundaries (docs/celld-behaviors.md F8).
 	testCelldImageOld = "ghcr.io/denoland/celld:v0.1.0"
 )
 
@@ -132,15 +132,16 @@ var _ = Describe("WorkerApp Controller", func() {
 			// answers 503 during a graceful drain (docs/celld-behaviors.md).
 			Expect(container.LivenessProbe.HTTPGet).To(BeNil())
 			Expect(container.LivenessProbe.TCPSocket).NotTo(BeNil())
-			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal("/__celld/health"))
+			Expect(container.ReadinessProbe.HTTPGet.Path).To(Equal(healthPath))
 			Expect(*sts.Spec.Template.Spec.TerminationGracePeriodSeconds).
-				To(BeNumerically(">", int64(shutdownDrainMs/1000)))
+				To(BeNumerically(">", int64(shutdownTotalMs/1000)))
 			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(appVersionAnnotation, "sha-test"))
 			env := map[string]string{}
 			for _, e := range container.Env {
 				env[e.Name] = e.Value
 			}
 			Expect(env).To(HaveKeyWithValue("CELLD_BUCKET", "s3://test-cells/apps/test"))
+			Expect(env).To(HaveKeyWithValue("CELLD_SHUTDOWN_TOTAL_MS", "40000"))
 			// Explicit shed threshold ≈80% of the 8Gi default limit, under
 			// celld's own 95% RSS cap (F10).
 			Expect(env).To(HaveKeyWithValue("CELLD_MAX_RSS_MB", "6553"))
@@ -366,11 +367,11 @@ var _ = Describe("WorkerApp Controller", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("bumping the celld image from v0.1 to v0.3, which crosses the flagged v0.1/v0.2 boundary")
+			By("bumping the celld image from v0.1 to v0.4, which crosses both stop-all boundaries")
 			resource := &platformv1alpha1.WorkerApp{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			// Seed the live StatefulSet with a v0.1 image so the transition
-			// to the spec's v0.3 image crosses the flagged boundary.
+			// to the spec's v0.4 image crosses flagged boundaries.
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
 			sts.Spec.Template.Spec.Containers[0].Image = testCelldImageOld
@@ -394,12 +395,12 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImageOld))
 		})
 
-		It("should refuse a rolling downgrade from v0.3 to v0.2 and surface the hazard on Recreate", func() {
+		It("should refuse a rolling downgrade from v0.4 to v0.2 and surface every hazard on Recreate", func() {
 			r := reconciler()
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
-			By("asking for a v0.2 image on a fleet running v0.3")
+			By("asking for a v0.2 image on a fleet running v0.4")
 			resource := &platformv1alpha1.WorkerApp{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			resource.Spec.Celld.Image = testCelldImageV021
@@ -411,6 +412,7 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseDegraded))
 			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("sealed epoch"))
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("peer tunnel"))
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImage))
