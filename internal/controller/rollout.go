@@ -91,6 +91,16 @@ var breakingBoundaries = []versionBoundary{
 			"can lose acknowledged writes unless every node's shutdown log shows " +
 			"\"node-log close: sealed epoch\"",
 	},
+	{
+		// v0.4 tunnels fetch, RPC, and WebSocket calls over a versioned
+		// peer protocol that refuses v0.3 peers. Its large Workers KV value
+		// references are also unreadable by v0.3, so neither direction may
+		// run as a mixed fleet.
+		lower: minorVersion{0, 3}, upper: minorVersion{0, 4}, upward: true, downward: true,
+		reason: "v0.3 and v0.4 nodes cannot share a fleet (the peer tunnel protocols are " +
+			"incompatible and v0.3 cannot read v0.4 large Workers KV value references); " +
+			"upstream requires stop-all-then-start",
+	},
 }
 
 // fleetOutcome is what one reconcile pass concluded about the fleet.

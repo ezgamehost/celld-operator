@@ -17,28 +17,30 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
 const (
-	// testCelldImageV021 is the last v0.2 release: paired with
-	// testCelldImage it exercises both the rolling-safe upgrade and the
-	// lossy downgrade (docs/celld-behaviors.md F8).
+	// testCelldImageV021 is the last v0.2 release: paired with v0.3 it
+	// exercises both the rolling-safe upgrade and the lossy downgrade
+	// (docs/celld-behaviors.md F8).
 	testCelldImageV021 = "ghcr.io/denoland/celld:v0.2.1"
-	// reasonMixedFleet is the substring of the v0.1/v0.2 boundary's reason
-	// that the tests key on.
+	// reasonMixedFleet is shared by the stop-all boundaries' reasons and
+	// keeps assertions focused on the operational requirement.
 	reasonMixedFleet = "cannot share a fleet"
 )
 
 // The table mirrors celld's release notes (docs/celld-behaviors.md F8):
-// v0.1 <-> v0.2 forbids a mixed fleet in both directions; v0.2 -> v0.3 is
+// v0.1 <-> v0.2 and v0.3 <-> v0.4 forbid mixed fleets; v0.2 -> v0.3 is
 // rolling-safe but v0.3 -> v0.2 can lose acknowledged writes.
 func TestIsBreakingUpgrade(t *testing.T) {
 	const (
 		v01 = "ghcr.io/denoland/celld:v0.1.0"
 		v02 = "ghcr.io/denoland/celld:v0.2.0"
 		v03 = "ghcr.io/denoland/celld:v0.3.0"
+		v04 = "ghcr.io/denoland/celld:v0.4.0"
 	)
 	cases := []struct {
 		name     string
@@ -53,12 +55,14 @@ func TestIsBreakingUpgrade(t *testing.T) {
 		{"v0.3 to v0.2 is a lossy downgrade", v03, testCelldImageV021, true, "sealed epoch"},
 		{"a jump that skips over a flagged boundary still crosses it", v01, v03, true, reasonMixedFleet},
 		{"a downgrade across two boundaries reports both", v03, v01, true, "sealed epoch"},
-		{"same image", v03, v03, false, ""},
-		{"unparseable tags are not refused", "ghcr.io/denoland/celld:latest", v03, false, ""},
-		{"a tag without a minor is not refused", "ghcr.io/denoland/celld:v1", v03, false, ""},
+		{"v0.3 to v0.4 cannot mix peer tunnel protocols", v03, v04, true, "peer tunnel"},
+		{"v0.4 to v0.3 cannot expose unreadable KV references", v04, v03, true, "Workers KV"},
+		{"same image", v04, v04, false, ""},
+		{"unparseable tags are not refused", "ghcr.io/denoland/celld:latest", v04, false, ""},
+		{"a tag without a minor is not refused", "ghcr.io/denoland/celld:v1", v04, false, ""},
 		{"registry with a port still parses the tag", "registry:5000/celld:v0.1.0", "registry:5000/celld:v0.2.0", true, reasonMixedFleet},
 		{"a tag with a digest suffix parses before the digest", "registry:5000/celld:v0.1.0@sha256:7c222fb2927d828af22f592134e8932480637c0d7f076771e81cf2acd7204ecf", "registry:5000/celld:v0.2.0", true, reasonMixedFleet},
-		{"a future minor with no flagged boundary", v03, "ghcr.io/denoland/celld:v0.4.0", false, ""},
+		{"a future minor with no flagged boundary", v04, "ghcr.io/denoland/celld:v0.5.0", false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,10 +76,44 @@ func TestIsBreakingUpgrade(t *testing.T) {
 		})
 	}
 
-	t.Run("a two-boundary downgrade names both hazards", func(t *testing.T) {
-		reason := breakingReason(v03, v01)
-		if !strings.Contains(reason, reasonMixedFleet) || !strings.Contains(reason, "sealed epoch") {
-			t.Errorf("breakingReason(v0.3, v0.1) = %q, want both boundary reasons", reason)
+	t.Run("a three-boundary downgrade names every hazard", func(t *testing.T) {
+		reason := breakingReason(v04, v01)
+		if !strings.Contains(reason, reasonMixedFleet) ||
+			!strings.Contains(reason, "sealed epoch") ||
+			!strings.Contains(reason, "peer tunnel") {
+			t.Errorf("breakingReason(v0.4, v0.1) = %q, want all boundary reasons", reason)
 		}
 	})
+}
+
+func TestPodStateV04MemoryFields(t *testing.T) {
+	const payload = `{
+		"occupied": 7,
+		"shedding": "memory",
+		"rss_bytes": 100,
+		"in_use_bytes": 80,
+		"cgroup_working_set_bytes": 90,
+		"cgroup_current_bytes": 120
+	}`
+	var state PodState
+	if err := json.Unmarshal([]byte(payload), &state); err != nil {
+		t.Fatalf("decode v0.4 /state: %v", err)
+	}
+	if state.CgroupWorkingSetBytes == nil || *state.CgroupWorkingSetBytes != 90 {
+		t.Errorf("cgroup_working_set_bytes = %v, want 90", state.CgroupWorkingSetBytes)
+	}
+	if state.CgroupCurrentBytes == nil || *state.CgroupCurrentBytes != 120 {
+		t.Errorf("cgroup_current_bytes = %v, want 120", state.CgroupCurrentBytes)
+	}
+	if !state.IsShedding() {
+		t.Error("v0.4 shedding reason should mark the pod as shedding")
+	}
+
+	var older PodState
+	if err := json.Unmarshal([]byte(`{"rss_bytes":100,"in_use_bytes":80}`), &older); err != nil {
+		t.Fatalf("decode pre-v0.4 /state: %v", err)
+	}
+	if older.CgroupWorkingSetBytes != nil || older.CgroupCurrentBytes != nil {
+		t.Errorf("absent cgroup fields decoded as %v, %v; want nil", older.CgroupWorkingSetBytes, older.CgroupCurrentBytes)
+	}
 }

@@ -74,11 +74,19 @@ var (
 	}, stateLabels)
 	metricRSSBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "celld_rss_bytes",
-		Help: "Resident set size of the celld process, from /state; celld's absolute cap (95% of the limit) applies to this.",
+		Help: "Resident set size of the celld process, from /state.",
 	}, stateLabels)
 	metricInUseBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "celld_in_use_bytes",
-		Help: "Memory the cells hold (RSS minus allocator retention), from /state; CELLD_MAX_RSS_MB applies to this.",
+		Help: "Process RSS minus allocator retention, from /state.",
+	}, stateLabels)
+	metricCgroupWorkingSetBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "celld_cgroup_working_set_bytes",
+		Help: "Active cgroup memory used by celld's v0.4 pressure threshold, from /state.",
+	}, stateLabels)
+	metricCgroupCurrentBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "celld_cgroup_current_bytes",
+		Help: "Complete cgroup charge used by celld's v0.4 absolute memory cap, from /state.",
 	}, stateLabels)
 	metricRestarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "celld_container_restarts",
@@ -99,15 +107,17 @@ func init() {
 	metrics.Registry.MustRegister(
 		metricResidentCells, metricEvicting, metricRestoring,
 		metricUtilization, metricShedding, metricUp,
-		metricRSSBytes, metricInUseBytes, metricRestarts, metricSelfFenced,
+		metricRSSBytes, metricInUseBytes,
+		metricCgroupWorkingSetBytes, metricCgroupCurrentBytes,
+		metricRestarts, metricSelfFenced,
 	)
 }
 
 // PodState is one pod's /state sample. The response schema is celld's alpha
 // operator API (actor.rs state_json): keep parsing tolerant, fail per-pod
 // not per-fleet, and pin operator and celld releases together
-// (docs/celld-behaviors.md). Fields celld added in v0.3.0 decode as zero on
-// an older node.
+// (docs/celld-behaviors.md). Fields added across releases decode as zero
+// or nil so an older node does not break the whole fleet sweep.
 type PodState struct {
 	Occupied int64 `json:"occupied"`
 	Evicting int64 `json:"evicting"`
@@ -119,17 +129,19 @@ type PodState struct {
 	ActivationWaiting int64 `json:"activation_waiting"`
 	CapacityWaiting   int64 `json:"capacity_waiting"`
 	// Shedding is null while healthy and a reason string during pressure
-	// shedding ("memory": the cells' memory crossed CELLD_MAX_RSS_MB;
-	// "rss-hard": the process RSS crossed celld's absolute cap) — the
-	// wire value is the shed reason, not a boolean. Decoding it as bool
-	// worked on null and failed exactly when a node started shedding,
-	// killing that pod's metrics and holding rollout gates at the worst
-	// moment.
+	// shedding ("memory": the cells' memory or active cgroup working set
+	// crossed CELLD_MAX_RSS_MB; "rss-hard": process RSS or the complete
+	// cgroup charge crossed celld's absolute cap). The wire value is the
+	// shed reason, not a boolean.
 	Shedding *string `json:"shedding"`
-	// Both memory numbers from one sample (v0.3.0+): the gap between them
-	// is allocator retention that shedding cannot return.
-	RSSBytes   int64 `json:"rss_bytes"`
-	InUseBytes int64 `json:"in_use_bytes"`
+	// v0.4 reports both cgroup measurements in addition to process RSS and
+	// allocator-adjusted RSS. They are null outside a readable Linux
+	// cgroup, so pointers preserve "not measured" instead of exporting a
+	// misleading zero.
+	RSSBytes              int64  `json:"rss_bytes"`
+	InUseBytes            int64  `json:"in_use_bytes"`
+	CgroupWorkingSetBytes *int64 `json:"cgroup_working_set_bytes"`
+	CgroupCurrentBytes    *int64 `json:"cgroup_current_bytes"`
 }
 
 // IsShedding reports whether the node is refusing new cells under pressure.
@@ -232,6 +244,8 @@ func (p *StatePoller) sweep(ctx context.Context) error {
 	metricUp.Reset()
 	metricRSSBytes.Reset()
 	metricInUseBytes.Reset()
+	metricCgroupWorkingSetBytes.Reset()
+	metricCgroupCurrentBytes.Reset()
 	metricRestarts.Reset()
 	metricSelfFenced.Reset()
 
@@ -270,6 +284,12 @@ func (p *StatePoller) sweep(ctx context.Context) error {
 			metricShedding.With(labels).Set(boolToGauge(state.IsShedding()))
 			metricRSSBytes.With(labels).Set(float64(state.RSSBytes))
 			metricInUseBytes.With(labels).Set(float64(state.InUseBytes))
+			if state.CgroupWorkingSetBytes != nil {
+				metricCgroupWorkingSetBytes.With(labels).Set(float64(*state.CgroupWorkingSetBytes))
+			}
+			if state.CgroupCurrentBytes != nil {
+				metricCgroupCurrentBytes.With(labels).Set(float64(*state.CgroupCurrentBytes))
+			}
 		}
 	}
 	return nil
