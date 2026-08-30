@@ -45,13 +45,52 @@ import (
 // operator owns the partition counter and steps it one ordinal at a time,
 // only when the whole fleet has re-warmed.
 
-// breakingBoundaries lists celld upgrades that upstream forbids as rolling
-// (mixed fleets break). Maintained from celld release notes
-// (docs/celld-behaviors.md, F8). Entries are "major.minor" pairs.
-var breakingBoundaries = [][2]string{
-	// v0.1 -> v0.2: ownership records changed address semantics and block
-	// objects changed format; upstream requires stop-all-then-start.
-	{"0.1", "0.2"},
+// minorVersion is the "major.minor" of a celld image tag, which is the
+// granularity upstream's rolling-safety notes speak in.
+type minorVersion struct{ major, minor int }
+
+func (v minorVersion) String() string { return fmt.Sprintf("%d.%d", v.major, v.minor) }
+
+func (v minorVersion) cmp(o minorVersion) int {
+	if v.major != o.major {
+		return v.major - o.major
+	}
+	return v.minor - o.minor
+}
+
+// versionBoundary is a line between two consecutive celld minors that a
+// rollout must not cross as a rolling update in the flagged direction(s).
+// A jump that skips minors still crosses every boundary in between.
+type versionBoundary struct {
+	lower, upper minorVersion
+	// upward refuses lower -> upper (the mixed fleet breaks); downward
+	// refuses upper -> lower (a downgrade upstream documents as lossy, or
+	// the same mixed-fleet break in reverse).
+	upward, downward bool
+	reason           string
+}
+
+// breakingBoundaries is maintained from celld's release notes
+// (docs/celld-behaviors.md, F8). Crossing one is refused unless the CR
+// says Recreate; the reason is reported on the CR.
+var breakingBoundaries = []versionBoundary{
+	{
+		lower: minorVersion{0, 1}, upper: minorVersion{0, 2}, upward: true, downward: true,
+		reason: "v0.1 and v0.2 nodes cannot share a fleet (ownership records changed address " +
+			"semantics and block objects changed format); upstream requires stop-all-then-start",
+	},
+	{
+		// v0.2.1 -> v0.3.0 is rolling-safe upstream: a v0.3 node that
+		// cannot replicate to a v0.2 peer falls back to bucket proofs. The
+		// downgrade is not: a v0.2 binary cannot read writes still waiting
+		// in v0.3's replicated log or bundle objects, so it can lose
+		// acknowledged writes unless every node sealed its log on the way
+		// out ("node-log close: sealed epoch" in the shutdown log).
+		lower: minorVersion{0, 2}, upper: minorVersion{0, 3}, downward: true,
+		reason: "a v0.2 node cannot read writes waiting in v0.3's replicated log, so the downgrade " +
+			"can lose acknowledged writes unless every node's shutdown log shows " +
+			"\"node-log close: sealed epoch\"",
+	},
 }
 
 // fleetOutcome is what one reconcile pass concluded about the fleet.
@@ -64,42 +103,54 @@ type fleetOutcome struct {
 	RolledOut bool
 }
 
-func minorOf(image string) (string, bool) {
+func minorOf(image string) (minorVersion, bool) {
+	image, _, _ = strings.Cut(image, "@")
 	idx := strings.LastIndex(image, ":")
 	if idx < 0 {
-		return "", false
+		return minorVersion{}, false
 	}
 	tag := strings.TrimPrefix(image[idx+1:], "v")
 	parts := strings.SplitN(tag, ".", 3)
 	if len(parts) < 2 {
-		return "", false
+		return minorVersion{}, false
 	}
-	if _, err := strconv.Atoi(parts[0]); err != nil {
-		return "", false
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return minorVersion{}, false
 	}
-	if _, err := strconv.Atoi(parts[1]); err != nil {
-		return "", false
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return minorVersion{}, false
 	}
-	return parts[0] + "." + parts[1], true
+	return minorVersion{major, minor}, true
 }
 
-// isBreakingUpgrade reports whether moving between these celld images (in
-// either direction) crosses a boundary that forbids a mixed fleet. Unknown
-// tags are treated as non-breaking: refusing every unparseable tag would
-// block private builds, and the table is a guard for known hazards, not a
-// proof of safety.
-func isBreakingUpgrade(fromImage, toImage string) bool {
+// breakingReason explains why moving between these celld images must not be
+// a rolling update, or returns "" when no flagged boundary is crossed in a
+// flagged direction. Unknown tags are treated as non-breaking: refusing
+// every unparseable tag would block private builds, and the table is a
+// guard for known hazards, not a proof of safety.
+func breakingReason(fromImage, toImage string) string {
 	from, okFrom := minorOf(fromImage)
 	to, okTo := minorOf(toImage)
 	if !okFrom || !okTo || from == to {
-		return false
+		return ""
 	}
+	var reasons []string
 	for _, b := range breakingBoundaries {
-		if (from == b[0] && to == b[1]) || (from == b[1] && to == b[0]) {
-			return true
+		crossesUp := from.cmp(b.lower) <= 0 && to.cmp(b.upper) >= 0
+		crossesDown := from.cmp(b.upper) >= 0 && to.cmp(b.lower) <= 0
+		if (b.upward && crossesUp) || (b.downward && crossesDown) {
+			reasons = append(reasons, b.reason)
 		}
 	}
-	return false
+	return strings.Join(reasons, "; ")
+}
+
+// isBreakingUpgrade reports whether moving between these celld images
+// crosses a flagged boundary in a flagged direction.
+func isBreakingUpgrade(fromImage, toImage string) bool {
+	return breakingReason(fromImage, toImage) != ""
 }
 
 func stsContainerImage(sts *appsv1.StatefulSet) string {
@@ -230,18 +281,23 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 	imageChanged := oldImage != "" && oldImage != app.Spec.Celld.Image
 
 	if templateChanged {
-		if imageChanged && isBreakingUpgrade(oldImage, app.Spec.Celld.Image) &&
-			app.Spec.Celld.UpdateStrategy != platformv1alpha1.UpdateStrategyRecreate {
+		var breaking string
+		if imageChanged {
+			breaking = breakingReason(oldImage, app.Spec.Celld.Image)
+		}
+		if breaking != "" && app.Spec.Celld.UpdateStrategy != platformv1alpha1.UpdateStrategyRecreate {
 			// Refuse: a rolling update across this boundary creates the
-			// mixed fleet upstream forbids (F8). A GitOps diff alone must
-			// not be able to do this; the CR has to say Recreate.
+			// mixed fleet upstream forbids, or the lossy downgrade it
+			// documents (F8). A GitOps diff alone must not be able to do
+			// this; the CR has to say Recreate.
 			return fleetOutcome{
-				Phase:     platformv1alpha1.PhaseDegraded,
-				WaitingOn: fmt.Sprintf("celld %s -> %s is not rolling-safe; set celld.updateStrategy: Recreate", oldImage, app.Spec.Celld.Image),
+				Phase: platformv1alpha1.PhaseDegraded,
+				WaitingOn: fmt.Sprintf("celld %s -> %s is not rolling-safe: %s; set celld.updateStrategy: Recreate",
+					oldImage, app.Spec.Celld.Image, breaking),
 			}, nil
 		}
 		if imageChanged && app.Spec.Celld.UpdateStrategy == platformv1alpha1.UpdateStrategyRecreate {
-			return r.recreateStep(ctx, app, &existing, desired)
+			return r.recreateStep(ctx, app, &existing, desired, breaking)
 		}
 		// Start a gated rolling update: apply the new template frozen at
 		// partition == live replicas, so no pod moves until we step.
@@ -384,10 +440,13 @@ func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1al
 	return out, nil
 }
 
-// recreateStep executes the stop-all-then-start path for celld upgrades
-// that forbid mixed fleets (F8). An availability event by design; the CR
-// had to say Recreate explicitly.
-func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1alpha1.WorkerApp, existing, desired *appsv1.StatefulSet) (fleetOutcome, error) {
+// recreateStep executes the stop-all-then-start path for celld version
+// changes that forbid mixed fleets or a live downgrade (F8). An
+// availability event by design; the CR had to say Recreate explicitly.
+// hazard, when non-empty, is the upstream reason the change is not
+// rolling-safe; it is surfaced while the fleet drains so an operator
+// watching the CR sees what the stop is protecting.
+func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1alpha1.WorkerApp, existing, desired *appsv1.StatefulSet, hazard string) (fleetOutcome, error) {
 	out := fleetOutcome{Phase: platformv1alpha1.PhaseRecreating, Requeue: 10 * time.Second}
 
 	// Phase A: scale the OLD template to zero and let every node drain.
@@ -398,7 +457,10 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 		} else if conflict {
 			return conflictOutcome(app), nil
 		}
-		out.WaitingOn = "scaling to zero for non-rolling celld upgrade"
+		out.WaitingOn = "scaling to zero for non-rolling celld change"
+		if hazard != "" {
+			out.WaitingOn += ": " + hazard
+		}
 		return out, nil
 	}
 	if existing.Status.Replicas > 0 {

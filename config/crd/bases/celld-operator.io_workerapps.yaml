@@ -118,6 +118,16 @@ spec:
                   credentialsFrom:
                     description: credentialsFrom selects the fleet's bucket credential.
                     properties:
+                      azureClientID:
+                        description: |-
+                          azureClientID is the client ID of a Microsoft Entra workload identity
+                          for an az:// container (AKS workload identity). The fleet
+                          ServiceAccount is annotated with it and fleet pods carry the
+                          azure.workload.identity/use label, so the AKS webhook injects the
+                          federated token celld reads (AZURE_CLIENT_ID, AZURE_TENANT_ID,
+                          AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST). The identity
+                          needs Storage Blob Data Contributor on the container.
+                        type: string
                       iamRole:
                         description: |-
                           iamRole is an IAM role ARN assumed via the pod's service account
@@ -126,30 +136,52 @@ spec:
                         type: string
                       secretRef:
                         description: |-
-                          secretRef names a Secret with static credentials
-                          (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), for stores where
-                          role-based auth is unavailable.
+                          secretRef names a Secret whose keys are injected as environment:
+                          AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for an s3:// bucket, or
+                          AZURE_STORAGE_ACCOUNT_KEY for an az:// container. For stores where
+                          identity-based auth is unavailable.
                         type: string
                     type: object
                   endpoint:
                     description: |-
                       endpoint is the S3-compatible endpoint URL, when not AWS S3.
-                      Rejected by celld for gs:// buckets.
+                      Rejected by celld for gs:// and az:// buckets.
+                    maxLength: 2048
                     type: string
                   name:
                     description: |-
-                      name is the fleet bucket and prefix, e.g. "s3://platform-cells/apps/chat"
-                      or "gs://platform-cells/apps/chat". The store must satisfy celld's
-                      fencing contract (conditional create/overwrite, read-after-write);
-                      see docs/celld-behaviors.md for the qualified list.
-                    pattern: ^(s3|gs)://.+
+                      name is the fleet bucket and prefix, e.g. "s3://platform-cells/apps/chat",
+                      "gs://platform-cells/apps/chat", or "az://platform-cells/apps/chat"
+                      (for az:// the bucket is a Blob Storage container in the account
+                      named by storageAccount). The store must satisfy celld's fencing
+                      contract (conditional create/overwrite, read-after-write); see
+                      docs/celld-behaviors.md for the qualified list.
+                    maxLength: 1024
+                    pattern: ^(s3|gs|az)://.+
                     type: string
                   region:
                     description: region is the storage region, when it cannot be inferred.
                     type: string
+                  storageAccount:
+                    description: |-
+                      storageAccount is the Azure storage account that holds an az://
+                      container (AZURE_STORAGE_ACCOUNT_NAME). Required for az://, ignored
+                      otherwise.
+                    maxLength: 24
+                    minLength: 3
+                    pattern: ^[a-z0-9]+$
+                    type: string
                 required:
                 - name
                 type: object
+                x-kubernetes-validations:
+                - message: an az:// bucket requires storageAccount (the Azure storage
+                    account; the bucket name is the container)
+                  rule: '!self.name.startsWith(''az://'') || (has(self.storageAccount)
+                    && self.storageAccount.size() > 0)'
+                - message: endpoint applies to s3:// buckets only; celld rejects an
+                    endpoint for gs:// and az://
+                  rule: '!has(self.endpoint) || self.endpoint.size() == 0 || self.name.startsWith(''s3://'')'
               celld:
                 description: CelldSpec pins the celld runtime for the fleet.
                 properties:
@@ -169,6 +201,17 @@ spec:
                 required:
                 - image
                 type: object
+              durability:
+                description: |-
+                  durability selects how celld proves a write before acknowledging it:
+                  fleet (celld's default: two follower nodes fsync it, the bucket
+                  upload follows) or bucket (the write is in the bucket first). Unset
+                  leaves celld's default. Changing it restarts the fleet through the
+                  ordinary gated rollout.
+                enum:
+                - fleet
+                - bucket
+                type: string
               hostnames:
                 description: |-
                   hostnames route to this app. One route object is reconciled in the
@@ -191,7 +234,9 @@ spec:
                   ResourcesSpec sizes one fleet pod. The operator derives the container
                   limit, CELLD_MAX_RSS_MB (~80% of the limit, set explicitly so the ceiling
                   is visible in the pod spec; celld would derive the same value from the
-                  cgroup limit itself), and admission caps from these two numbers.
+                  cgroup limit itself), and admission caps from these two numbers. celld
+                  applies that threshold to the memory its cells hold and keeps its own
+                  absolute cap at 95% of the limit on the process RSS (docs/celld-behaviors.md F10).
                 properties:
                   maxResidentCells:
                     default: 1000
@@ -261,6 +306,16 @@ spec:
                     - otlp
                     type: string
                 type: object
+              trustForwardedHeaders:
+                description: |-
+                  trustForwardedHeaders lets X-Forwarded-Host and X-Forwarded-Proto
+                  set the scheme and host of request.url (CELLD_TRUST_FORWARDED_HEADERS).
+                  celld ignores both headers by default, so behind a TLS-terminating
+                  ingress a Worker sees its pod address as its URL. Enable it only when
+                  every hop in front of the fleet replaces both headers (ingress-nginx
+                  does; Envoy-based gateways set X-Forwarded-Proto but not always
+                  X-Forwarded-Host), since celld takes the last value of each.
+                type: boolean
               vars:
                 description: VarsSpec supplies Worker variables and secrets.
                 properties:

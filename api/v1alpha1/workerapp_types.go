@@ -29,7 +29,8 @@ import (
 // UpdateStrategy selects how a celld version change rolls through the fleet.
 // Rolling is the partition-stepped, restoring-gated path (docs/celld-behaviors.md);
 // Recreate scales to zero first, for upstream releases that forbid mixed
-// fleets. A Rolling request across a known-breaking celld boundary is refused.
+// fleets or flag a downgrade as lossy. A Rolling request across a
+// known-breaking celld boundary is refused (F8).
 // +kubebuilder:validation:Enum=Rolling;Recreate
 type UpdateStrategy string
 
@@ -61,27 +62,53 @@ type BucketCredentials struct {
 	// +optional
 	IAMRole string `json:"iamRole,omitempty"`
 
-	// secretRef names a Secret with static credentials
-	// (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY), for stores where
-	// role-based auth is unavailable.
+	// secretRef names a Secret whose keys are injected as environment:
+	// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for an s3:// bucket, or
+	// AZURE_STORAGE_ACCOUNT_KEY for an az:// container. For stores where
+	// identity-based auth is unavailable.
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
+
+	// azureClientID is the client ID of a Microsoft Entra workload identity
+	// for an az:// container (AKS workload identity). The fleet
+	// ServiceAccount is annotated with it and fleet pods carry the
+	// azure.workload.identity/use label, so the AKS webhook injects the
+	// federated token celld reads (AZURE_CLIENT_ID, AZURE_TENANT_ID,
+	// AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST). The identity
+	// needs Storage Blob Data Contributor on the container.
+	// +optional
+	AzureClientID string `json:"azureClientID,omitempty"`
 }
 
 // BucketSpec locates the fleet's slice of the object store.
+// +kubebuilder:validation:XValidation:rule="!self.name.startsWith('az://') || (has(self.storageAccount) && self.storageAccount.size() > 0)",message="an az:// bucket requires storageAccount (the Azure storage account; the bucket name is the container)"
+// +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || self.endpoint.size() == 0 || self.name.startsWith('s3://')",message="endpoint applies to s3:// buckets only; celld rejects an endpoint for gs:// and az://"
 type BucketSpec struct {
-	// name is the fleet bucket and prefix, e.g. "s3://platform-cells/apps/chat"
-	// or "gs://platform-cells/apps/chat". The store must satisfy celld's
-	// fencing contract (conditional create/overwrite, read-after-write);
-	// see docs/celld-behaviors.md for the qualified list.
+	// name is the fleet bucket and prefix, e.g. "s3://platform-cells/apps/chat",
+	// "gs://platform-cells/apps/chat", or "az://platform-cells/apps/chat"
+	// (for az:// the bucket is a Blob Storage container in the account
+	// named by storageAccount). The store must satisfy celld's fencing
+	// contract (conditional create/overwrite, read-after-write); see
+	// docs/celld-behaviors.md for the qualified list.
 	// +required
-	// +kubebuilder:validation:Pattern=`^(s3|gs)://.+`
+	// +kubebuilder:validation:Pattern=`^(s3|gs|az)://.+`
+	// +kubebuilder:validation:MaxLength=1024
 	Name string `json:"name"`
 
 	// endpoint is the S3-compatible endpoint URL, when not AWS S3.
-	// Rejected by celld for gs:// buckets.
+	// Rejected by celld for gs:// and az:// buckets.
 	// +optional
+	// +kubebuilder:validation:MaxLength=2048
 	Endpoint string `json:"endpoint,omitempty"`
+
+	// storageAccount is the Azure storage account that holds an az://
+	// container (AZURE_STORAGE_ACCOUNT_NAME). Required for az://, ignored
+	// otherwise.
+	// +optional
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=24
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]+$`
+	StorageAccount string `json:"storageAccount,omitempty"`
 
 	// region is the storage region, when it cannot be inferred.
 	// +optional
@@ -95,7 +122,9 @@ type BucketSpec struct {
 // ResourcesSpec sizes one fleet pod. The operator derives the container
 // limit, CELLD_MAX_RSS_MB (~80% of the limit, set explicitly so the ceiling
 // is visible in the pod spec; celld would derive the same value from the
-// cgroup limit itself), and admission caps from these two numbers.
+// cgroup limit itself), and admission caps from these two numbers. celld
+// applies that threshold to the memory its cells hold and keeps its own
+// absolute cap at 95% of the limit on the process RSS (docs/celld-behaviors.md F10).
 type ResourcesSpec struct {
 	// memoryGi is the container memory limit per pod, in GiB.
 	// +optional
@@ -231,6 +260,22 @@ func (t *TelemetrySpec) ResolvedSink() TelemetrySink {
 	return TelemetrySinkBucket
 }
 
+// Durability selects celld's write-acknowledgement proof (CELLD_DURABILITY,
+// docs/celld-behaviors.md F13).
+// +kubebuilder:validation:Enum=fleet;bucket
+type Durability string
+
+const (
+	// DurabilityFleet (celld's default since v0.3.0) acknowledges a write
+	// once two follower nodes hold it on disk, and tiers it to the bucket
+	// behind. A one-node fleet behaves as bucket.
+	DurabilityFleet Durability = "fleet"
+	// DurabilityBucket acknowledges a write only after it is in the bucket
+	// (celld's pre-0.3 behavior): higher write latency, no reliance on
+	// follower disks.
+	DurabilityBucket Durability = "bucket"
+)
+
 // WorkerAppSpec defines the desired state of WorkerApp.
 type WorkerAppSpec struct {
 	// hostnames route to this app. One route object is reconciled in the
@@ -286,6 +331,24 @@ type WorkerAppSpec struct {
 
 	// +optional
 	Telemetry TelemetrySpec `json:"telemetry,omitzero"`
+
+	// durability selects how celld proves a write before acknowledging it:
+	// fleet (celld's default: two follower nodes fsync it, the bucket
+	// upload follows) or bucket (the write is in the bucket first). Unset
+	// leaves celld's default. Changing it restarts the fleet through the
+	// ordinary gated rollout.
+	// +optional
+	Durability Durability `json:"durability,omitempty"`
+
+	// trustForwardedHeaders lets X-Forwarded-Host and X-Forwarded-Proto
+	// set the scheme and host of request.url (CELLD_TRUST_FORWARDED_HEADERS).
+	// celld ignores both headers by default, so behind a TLS-terminating
+	// ingress a Worker sees its pod address as its URL. Enable it only when
+	// every hop in front of the fleet replaces both headers (ingress-nginx
+	// does; Envoy-based gateways set X-Forwarded-Proto but not always
+	// X-Forwarded-Host), since celld takes the last value of each.
+	// +optional
+	TrustForwardedHeaders bool `json:"trustForwardedHeaders,omitempty"`
 }
 
 // WorkerAppPhase summarizes the fleet at a glance.

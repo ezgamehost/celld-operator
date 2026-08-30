@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -79,7 +80,18 @@ const (
 	// ordinary gated rollout — without it, rotation silently did nothing
 	// until some unrelated rollout happened to restart the fleet.
 	configHashAnnotation = "celld-operator.io/config-hash"
+
+	// AKS workload identity: the admission webhook injects the federated
+	// token environment into pods carrying the use label whose
+	// ServiceAccount names a client ID. celld reads exactly that
+	// environment for an az:// container (docs/celld-behaviors.md F7).
+	azureWorkloadIdentityUseLabel = "azure.workload.identity/use"
+	azureClientIDAnnotation       = "azure.workload.identity/client-id"
 )
+
+func isAzureBucket(app *platformv1alpha1.WorkerApp) bool {
+	return strings.HasPrefix(app.Spec.Bucket.Name, "az://")
+}
 
 func fleetName(app *platformv1alpha1.WorkerApp) string {
 	return app.Name + "-celld"
@@ -129,9 +141,12 @@ func maxResidentCells(app *platformv1alpha1.WorkerApp) int32 {
 // is the resolved deployment version (pinned or bucket-tracked).
 func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion string) corev1.PodTemplateSpec {
 	memGi := memoryGi(app)
-	// Explicit RSS threshold ≈80% of the container limit. celld computes the
-	// same 80% from the cgroup limit on its own; setting it makes the ceiling
-	// visible in the pod spec and stable if that derivation ever changes.
+	// Explicit shed threshold ≈80% of the container limit. celld computes
+	// the same 80% from the cgroup limit on its own; setting it makes the
+	// ceiling visible in the pod spec and stable if that derivation ever
+	// changes. It stays under celld's own absolute RSS cap (95% of the
+	// limit), so the cell-memory threshold keeps the recovery property of
+	// shedding (docs/celld-behaviors.md F10).
 	rssMb := memGi * 1024 * 4 / 5
 
 	env := []corev1.EnvVar{
@@ -155,6 +170,23 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 	}
 	if app.Spec.Bucket.Region != "" {
 		env = append(env, corev1.EnvVar{Name: "AWS_REGION", Value: app.Spec.Bucket.Region})
+	}
+	if isAzureBucket(app) && app.Spec.Bucket.StorageAccount != "" {
+		// celld takes the account from the environment; the bucket name
+		// is the container (F7). A credential Secret may carry the same
+		// key — `env` wins over `envFrom`, and the CRD requires this
+		// field for az://, so the pod spec is the one source of truth.
+		env = append(env, corev1.EnvVar{Name: "AZURE_STORAGE_ACCOUNT_NAME", Value: app.Spec.Bucket.StorageAccount})
+	}
+	if app.Spec.Durability != "" {
+		// Unset keeps celld's default (fleet since v0.3.0), so the fleet
+		// follows upstream unless the CR pins a proof (F13).
+		env = append(env, corev1.EnvVar{Name: "CELLD_DURABILITY", Value: string(app.Spec.Durability)})
+	}
+	if app.Spec.TrustForwardedHeaders {
+		// Off unless asked: celld reads the last value of each header, so
+		// this is only safe when every proxy hop replaces both.
+		env = append(env, corev1.EnvVar{Name: "CELLD_TRUST_FORWARDED_HEADERS", Value: "1"})
 	}
 	telemetryOn := app.Spec.Telemetry.Enabled == nil || *app.Spec.Telemetry.Enabled
 	if telemetryOn {
@@ -260,9 +292,16 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		annotations[configHashAnnotation] = configHash
 	}
 
+	labels := fleetLabels(app)
+	if app.Spec.Bucket.CredentialsFrom.AzureClientID != "" {
+		// Pod-only label (never part of the selector): it is what makes
+		// the AKS webhook mutate the pod.
+		labels[azureWorkloadIdentityUseLabel] = "true"
+	}
+
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
-			Labels:      fleetLabels(app),
+			Labels:      labels,
 			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
@@ -270,6 +309,18 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 			TerminationGracePeriodSeconds: ptr.To(int64(terminationGraceS)),
 			Containers:                    []corev1.Container{container},
 			Volumes:                       volumes,
+			// Fleet durability (F13) acknowledges a write once two follower
+			// nodes hold it on their local disk; the bucket upload trails.
+			// Until it lands, that write exists on three pods' emptyDirs,
+			// so co-locating them turns one host failure into lost
+			// acknowledged writes. Spread across hosts — soft, so a
+			// single-node dev cluster still schedules.
+			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
+				MaxSkew:           1,
+				TopologyKey:       "kubernetes.io/hostname",
+				WhenUnsatisfiable: corev1.ScheduleAnyway,
+				LabelSelector:     &metav1.LabelSelector{MatchLabels: selectorLabels(app)},
+			}},
 		},
 	}
 }
@@ -364,12 +415,20 @@ func buildServiceAccount(app *platformv1alpha1.WorkerApp) *corev1.ServiceAccount
 			Labels:    fleetLabels(app),
 		},
 	}
-	// IRSA: the bucket credential is fleet-admin authority, so it arrives
-	// through the pod identity, scoped to this fleet's prefix (docs/celld-behaviors.md).
-	// GKE Workload Identity wiring is a v1 item; "auto" provisioning is
-	// docs/celld-behaviors.md "known not-implemented" and is surfaced as a condition.
+	// The bucket credential is fleet-admin authority, so it arrives through
+	// the pod identity, scoped to this fleet's prefix (docs/celld-behaviors.md F7):
+	// IRSA on EKS, workload identity on AKS. GKE Workload Identity wiring
+	// is a v1 item; "auto" provisioning is docs/celld-behaviors.md "known
+	// not-implemented" and is surfaced as a condition.
+	annotations := map[string]string{}
 	if role := app.Spec.Bucket.CredentialsFrom.IAMRole; role != "" && role != iamRoleAuto {
-		sa.Annotations = map[string]string{"eks.amazonaws.com/role-arn": role}
+		annotations["eks.amazonaws.com/role-arn"] = role
+	}
+	if clientID := app.Spec.Bucket.CredentialsFrom.AzureClientID; clientID != "" {
+		annotations[azureClientIDAnnotation] = clientID
+	}
+	if len(annotations) > 0 {
+		sa.Annotations = annotations
 	}
 	return sa
 }

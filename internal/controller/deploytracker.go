@@ -158,10 +158,31 @@ func (r *WorkerAppReconciler) pointerVersion(ctx context.Context, app *platformv
 	return fresh, false, nil
 }
 
+// trackableBucket reports whether the operator can read the fleet's deploy
+// pointer: it speaks the S3 API only, so gs:// and az:// fleets must pin
+// appVersion (docs/celld-behaviors.md, known not-implemented).
+func trackableBucket(app *platformv1alpha1.WorkerApp) bool {
+	return strings.HasPrefix(app.Spec.Bucket.Name, "s3://")
+}
+
 // resolveAppVersion turns spec.appVersion into the concrete version the
 // fleet should serve. tracking reports auto mode (the caller shortens its
 // requeue to the poll cadence).
 func (r *WorkerAppReconciler) resolveAppVersion(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) (version string, tracking bool) {
+	if !trackableBucket(app) {
+		if app.Spec.AppVersion != AppVersionAuto {
+			return app.Spec.AppVersion, false
+		}
+		// Say why, once, rather than reporting the store as unreachable
+		// every poll; and never roll to nowhere.
+		*conditions = append(*conditions, metav1.Condition{
+			Type: condDeployTrackingReady, Status: metav1.ConditionFalse,
+			Reason: "UnsupportedStore",
+			Message: fmt.Sprintf("appVersion \"auto\" reads deploy/current.json over the S3 API only; pin appVersion for %s",
+				app.Spec.Bucket.Name),
+		})
+		return r.liveTemplateVersion(ctx, app), false
+	}
 	if app.Spec.AppVersion != AppVersionAuto {
 		// Pinned. Best-effort drift warning when the fleet has readable
 		// static credentials: nodes load what current.json names, so a

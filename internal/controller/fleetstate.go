@@ -72,30 +72,64 @@ var (
 		Name: "celld_state_up",
 		Help: "1 if the pod's internal /state endpoint answered the last poll.",
 	}, stateLabels)
+	metricRSSBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "celld_rss_bytes",
+		Help: "Resident set size of the celld process, from /state; celld's absolute cap (95% of the limit) applies to this.",
+	}, stateLabels)
+	metricInUseBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "celld_in_use_bytes",
+		Help: "Memory the cells hold (RSS minus allocator retention), from /state; CELLD_MAX_RSS_MB applies to this.",
+	}, stateLabels)
+	metricRestarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "celld_container_restarts",
+		Help: "Kubelet restart count of the celld container; celld relies on the supervisor restarting it after a self-fence.",
+	}, stateLabels)
+	metricSelfFenced = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "celld_self_fenced",
+		Help: "1 if the celld container's last termination was a self-fence (exit code 3): it lost its lease or its storage probe failed.",
+	}, stateLabels)
 )
+
+// selfFenceExitCode is what celld exits with after logging "SELF-FENCE:"
+// (celld docs/fencing.md); the kubelet restarts it, and this is the one
+// signal that distinguishes a fence from any other crash.
+const selfFenceExitCode = 3
 
 func init() {
 	metrics.Registry.MustRegister(
 		metricResidentCells, metricEvicting, metricRestoring,
 		metricUtilization, metricShedding, metricUp,
+		metricRSSBytes, metricInUseBytes, metricRestarts, metricSelfFenced,
 	)
 }
 
 // PodState is one pod's /state sample. The response schema is celld's alpha
-// operator API (main.rs state_json): keep parsing tolerant, fail per-pod
+// operator API (actor.rs state_json): keep parsing tolerant, fail per-pod
 // not per-fleet, and pin operator and celld releases together
-// (docs/celld-behaviors.md).
+// (docs/celld-behaviors.md). Fields celld added in v0.3.0 decode as zero on
+// an older node.
 type PodState struct {
 	Occupied int64 `json:"occupied"`
 	Evicting int64 `json:"evicting"`
-	// Restoring is state_json's activation backlog.
-	Restoring int64 `json:"restoring"`
-	// Shedding is null while healthy and a reason string (e.g. "rss")
-	// during pressure shedding — the wire value is the shed reason, not a
-	// boolean. Decoding it as bool worked on null and failed exactly when
-	// a node started shedding, killing that pod's metrics and holding
-	// rollout gates at the worst moment.
+	// Restoring is state_json's activation backlog: every cold route that
+	// holds an activation permit or waits for one. v0.3.0 also reports
+	// its parts.
+	Restoring         int64 `json:"restoring"`
+	Activating        int64 `json:"activating"`
+	ActivationWaiting int64 `json:"activation_waiting"`
+	CapacityWaiting   int64 `json:"capacity_waiting"`
+	// Shedding is null while healthy and a reason string during pressure
+	// shedding ("memory": the cells' memory crossed CELLD_MAX_RSS_MB;
+	// "rss-hard": the process RSS crossed celld's absolute cap) — the
+	// wire value is the shed reason, not a boolean. Decoding it as bool
+	// worked on null and failed exactly when a node started shedding,
+	// killing that pod's metrics and holding rollout gates at the worst
+	// moment.
 	Shedding *string `json:"shedding"`
+	// Both memory numbers from one sample (v0.3.0+): the gap between them
+	// is allocator retention that shedding cannot return.
+	RSSBytes   int64 `json:"rss_bytes"`
+	InUseBytes int64 `json:"in_use_bytes"`
 }
 
 // IsShedding reports whether the node is refusing new cells under pressure.
@@ -196,6 +230,10 @@ func (p *StatePoller) sweep(ctx context.Context) error {
 	metricUtilization.Reset()
 	metricShedding.Reset()
 	metricUp.Reset()
+	metricRSSBytes.Reset()
+	metricInUseBytes.Reset()
+	metricRestarts.Reset()
+	metricSelfFenced.Reset()
 
 	for i := range apps.Items {
 		app := &apps.Items[i]
@@ -214,6 +252,11 @@ func (p *StatePoller) sweep(ctx context.Context) error {
 			labels := prometheus.Labels{
 				labelNamespace: app.Namespace, labelWorkerApp: app.Name, labelPod: pod.Name,
 			}
+			// Restart bookkeeping comes from the pod, not /state, so it is
+			// reported even while the node is down (F12).
+			restarts, selfFenced := celldRestarts(pod)
+			metricRestarts.With(labels).Set(float64(restarts))
+			metricSelfFenced.With(labels).Set(boolToGauge(selfFenced))
 			state, err := p.State.Fetch(ctx, pod.Status.PodIP)
 			if err != nil {
 				metricUp.With(labels).Set(0)
@@ -224,12 +267,33 @@ func (p *StatePoller) sweep(ctx context.Context) error {
 			metricEvicting.With(labels).Set(float64(state.Evicting))
 			metricRestoring.With(labels).Set(float64(state.Restoring))
 			metricUtilization.With(labels).Set(float64(state.Occupied) / maxCells)
-			if state.IsShedding() {
-				metricShedding.With(labels).Set(1)
-			} else {
-				metricShedding.With(labels).Set(0)
-			}
+			metricShedding.With(labels).Set(boolToGauge(state.IsShedding()))
+			metricRSSBytes.With(labels).Set(float64(state.RSSBytes))
+			metricInUseBytes.With(labels).Set(float64(state.InUseBytes))
 		}
 	}
 	return nil
+}
+
+// celldRestarts reads the celld container's restart count and whether its
+// last termination was a self-fence.
+func celldRestarts(pod *corev1.Pod) (restarts int32, selfFenced bool) {
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != celldContainerName {
+			continue
+		}
+		restarts = cs.RestartCount
+		if t := cs.LastTerminationState.Terminated; t != nil {
+			selfFenced = t.ExitCode == selfFenceExitCode
+		}
+		return restarts, selfFenced
+	}
+	return 0, false
+}
+
+func boolToGauge(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
