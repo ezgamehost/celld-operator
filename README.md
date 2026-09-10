@@ -18,6 +18,8 @@ the WorkerApp reference, networking, autoscaling, and operations guides.
 > in [docs/celld-behaviors.md](docs/celld-behaviors.md); this README is the
 > operational guide.
 
+The [production audit](docs/production-audit.md) records remaining operational risks and recommended feature changes.
+
 ## How it works
 
 celld nodes coordinate through a bucket — deployments, cell state (one SQLite

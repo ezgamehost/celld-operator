@@ -76,6 +76,11 @@ func main() {
 		os.Exit(2)
 	}
 
+	if f.writers < 2 || f.rounds < 1 {
+		fmt.Fprintln(os.Stderr, "--writers must be at least 2 and --rounds must be positive")
+		os.Exit(2)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -97,13 +102,15 @@ func main() {
 	violations += runPhase(ctx, cli, f, "update", raceUpdate)
 
 	if violations > 0 {
-		fmt.Printf("\nFAIL: %d rounds admitted more than one winner — this store cannot fence celld cells\n", violations)
+		fmt.Printf("\nFAIL: %d rounds did not have exactly one winner — this store cannot fence celld cells\n", violations)
 		os.Exit(1)
 	}
 	fmt.Println("\nOK: every round had exactly one winner (atomicity holds for this run; rerun per store release)")
 }
 
-type racer func(ctx context.Context, cli *s3.Client, f flags, key string, writer int) (won bool, err error)
+type racer func(
+	ctx context.Context, cli *s3.Client, f flags, key string, writer int, etag *string,
+) (won bool, err error)
 
 func runPhase(ctx context.Context, cli *s3.Client, f flags, name string, race racer) int {
 	violations := 0
@@ -112,6 +119,7 @@ func runPhase(ctx context.Context, cli *s3.Client, f flags, name string, race ra
 
 		// The update phase races If-Match against a seeded object; the
 		// create phase races If-None-Match:* against an absent key.
+		var etag *string
 		if name == "update" {
 			if _, err := cli.PutObject(ctx, &s3.PutObjectInput{
 				Bucket: &f.bucket, Key: &key, Body: bytes.NewReader([]byte("seed")),
@@ -119,6 +127,14 @@ func runPhase(ctx context.Context, cli *s3.Client, f flags, name string, race ra
 				fmt.Fprintf(os.Stderr, "round %d: seeding: %v\n", round, err)
 				os.Exit(2)
 			}
+			// Read once before releasing any writer. Per-writer HEADs can
+			// observe earlier winners and turn the race into valid serial CASes.
+			head, err := cli.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &f.bucket, Key: &key})
+			if err != nil || head == nil || head.ETag == nil {
+				fmt.Fprintf(os.Stderr, "round %d: reading seed ETag: %v\n", round, err)
+				os.Exit(2)
+			}
+			etag = head.ETag
 		}
 
 		var mu sync.Mutex
@@ -131,7 +147,7 @@ func runPhase(ctx context.Context, cli *s3.Client, f flags, name string, race ra
 			go func(w int) {
 				defer wg.Done()
 				<-start
-				won, err := race(ctx, cli, f, key, w)
+				won, err := race(ctx, cli, f, key, w, etag)
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
@@ -164,7 +180,7 @@ func runPhase(ctx context.Context, cli *s3.Client, f flags, name string, race ra
 
 // raceCreate: N writers race a conditional create (If-None-Match: *) on an
 // absent key — celld's ownership-record acquisition and epoch seal.
-func raceCreate(ctx context.Context, cli *s3.Client, f flags, key string, writer int) (bool, error) {
+func raceCreate(ctx context.Context, cli *s3.Client, f flags, key string, writer int, etag *string) (bool, error) {
 	body := fmt.Sprintf("writer-%d", writer)
 	_, err := cli.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      &f.bucket,
@@ -175,20 +191,16 @@ func raceCreate(ctx context.Context, cli *s3.Client, f flags, key string, writer
 	return classify(err)
 }
 
-// raceUpdate: N writers read the seeded object's ETag, then race a
+// raceUpdate: N writers share the seeded object's ETag, then race a
 // conditional overwrite (If-Match) — celld's ownership compare-and-swap.
 // Every writer holds the SAME valid ETag, so atomicity alone decides.
-func raceUpdate(ctx context.Context, cli *s3.Client, f flags, key string, writer int) (bool, error) {
-	head, err := cli.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &f.bucket, Key: &key})
-	if err != nil {
-		return false, fmt.Errorf("head before CAS: %w", err)
-	}
+func raceUpdate(ctx context.Context, cli *s3.Client, f flags, key string, writer int, etag *string) (bool, error) {
 	body := fmt.Sprintf("writer-%d", writer)
-	_, err = cli.PutObject(ctx, &s3.PutObjectInput{
+	_, err := cli.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:  &f.bucket,
 		Key:     &key,
 		Body:    bytes.NewReader([]byte(body)),
-		IfMatch: head.ETag,
+		IfMatch: etag,
 	})
 	return classify(err)
 }

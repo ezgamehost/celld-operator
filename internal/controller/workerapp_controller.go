@@ -135,6 +135,10 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	if !app.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
 	var conditions []metav1.Condition
 
 	// Foundation objects first: the StatefulSet references the service
@@ -178,7 +182,7 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	if outcome.WaitingOn != "" {
-		log.Info("fleet reconciled", "phase", outcome.Phase, "waitingOn", outcome.WaitingOn)
+		log.Info("Reconciled fleet", "phase", outcome.Phase, "waitingOn", outcome.WaitingOn)
 	}
 	return ctrl.Result{RequeueAfter: outcome.Requeue}, nil
 }
@@ -186,7 +190,17 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) error {
 	sa := buildServiceAccount(app)
 	if err := r.ensureObject(ctx, app, sa, func(live, desired client.Object) {
-		live.SetAnnotations(desired.GetAnnotations())
+		annotations := mergeStringMaps(live.GetAnnotations(), desired.GetAnnotations())
+		// Preserve externally provisioned identity in auto mode and foreign metadata.
+		for _, key := range []string{"eks.amazonaws.com/role-arn", azureClientIDAnnotation} {
+			if _, wanted := desired.GetAnnotations()[key]; !wanted && app.Spec.Bucket.CredentialsFrom.IAMRole != iamRoleAuto {
+				delete(annotations, key)
+			}
+		}
+		if len(annotations) == 0 {
+			annotations = nil
+		}
+		live.SetAnnotations(annotations)
 	}); err != nil {
 		return fmt.Errorf("service account: %w", err)
 	}
@@ -219,6 +233,16 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 	if err := r.ensureObject(ctx, app, public, func(live, desired client.Object) {
 		l, d := live.(*corev1.Service), desired.(*corev1.Service)
 		l.Spec.Selector = d.Spec.Selector
+		// Preserve API-allocated node ports while the Service still uses them.
+		if d.Spec.Type == corev1.ServiceTypeNodePort || d.Spec.Type == corev1.ServiceTypeLoadBalancer {
+			for i := range d.Spec.Ports {
+				for _, port := range l.Spec.Ports {
+					if port.Name == d.Spec.Ports[i].Name {
+						d.Spec.Ports[i].NodePort = port.NodePort
+					}
+				}
+			}
+		}
 		l.Spec.Ports = d.Spec.Ports
 		l.Spec.Type = d.Spec.Type
 		// Cloud LB configuration rides on annotations; merge so the cloud
@@ -265,6 +289,9 @@ func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1a
 	if err != nil {
 		return err
 	}
+	if err := requireOwnership(app, live); err != nil {
+		return err
+	}
 	before := live.DeepCopyObject().(client.Object)
 	mutate(live, desired)
 	live.SetLabels(mergeStringMaps(live.GetLabels(), desired.GetLabels()))
@@ -272,6 +299,14 @@ func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1a
 		return nil
 	}
 	return r.Update(ctx, live)
+}
+
+// requireOwnership prevents name collisions from modifying another workload.
+func requireOwnership(app *platformv1alpha1.WorkerApp, obj client.Object) error {
+	if !metav1.IsControlledBy(obj, app) {
+		return fmt.Errorf("refusing to modify %T %s: not controlled by WorkerApp %s", obj, client.ObjectKeyFromObject(obj), client.ObjectKeyFromObject(app))
+	}
+	return nil
 }
 
 // The ensure helpers return true when they hit a transient error worth a
@@ -422,8 +457,23 @@ func (r *WorkerAppReconciler) ensureScaledObject(ctx context.Context, app *platf
 		obj.SetKind("ScaledObject")
 		obj.SetName(fleetName(app))
 		obj.SetNamespace(app.Namespace)
-		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
-			logf.FromContext(ctx).Error(err, "deleting stale ScaledObject")
+		err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return false
+		}
+		if err == nil {
+			err = requireOwnership(app, obj)
+		}
+		if err == nil {
+			uid, rv := obj.GetUID(), obj.GetResourceVersion()
+			err = r.Delete(ctx, obj, client.Preconditions{UID: &uid, ResourceVersion: &rv})
+		}
+		if err != nil && !apierrors.IsNotFound(err) {
+			*conditions = append(*conditions, metav1.Condition{
+				Type: condAutoscalingReady, Status: metav1.ConditionFalse,
+				Reason: "ScaledObjectError", Message: err.Error(),
+			})
+			return true
 		}
 		return false
 	}
@@ -466,6 +516,9 @@ func (r *WorkerAppReconciler) ensureUnstructured(ctx context.Context, app *platf
 	if err != nil {
 		return err
 	}
+	if err := requireOwnership(app, live); err != nil {
+		return err
+	}
 	// Merge, never replace, metadata — other controllers annotate and
 	// label these objects (KEDA stamps ScaledObjects with a name label),
 	// and wiping their keys puts both controllers in a conflict loop.
@@ -485,6 +538,9 @@ func (r *WorkerAppReconciler) ensureUnstructured(ctx context.Context, app *platf
 // mergeStringMaps overlays desired onto live: our keys win, foreign keys
 // survive.
 func mergeStringMaps(live, desired map[string]string) map[string]string {
+	if len(live) == 0 && len(desired) == 0 {
+		return nil
+	}
 	out := make(map[string]string, len(live)+len(desired))
 	maps.Copy(out, live)
 	maps.Copy(out, desired)
@@ -493,7 +549,7 @@ func mergeStringMaps(live, desired map[string]string) map[string]string {
 
 func stringMapSubset(sub, of map[string]string) bool {
 	for k, v := range sub {
-		if of[k] != v {
+		if actual, ok := of[k]; !ok || actual != v {
 			return false
 		}
 	}
@@ -501,6 +557,7 @@ func stringMapSubset(sub, of map[string]string) bool {
 }
 
 func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, appVersion string, conditions []metav1.Condition) error {
+	before := app.DeepCopy().Status
 	app.Status.Phase = outcome.Phase
 	app.Status.Rollout = platformv1alpha1.RolloutStatus{
 		Partition: outcome.Partition,
@@ -550,6 +607,9 @@ func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1a
 		cond.ObservedGeneration = app.Generation
 		meta.SetStatusCondition(&app.Status.Conditions, cond)
 	}
+	if apiequality.Semantic.DeepEqual(before, app.Status) {
+		return nil
+	}
 	return r.Status().Update(ctx, app)
 }
 
@@ -580,6 +640,7 @@ func (r *WorkerAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
+		Owns(&networkingv1.Ingress{}).
 		Named("workerapp").
 		Complete(r)
 }

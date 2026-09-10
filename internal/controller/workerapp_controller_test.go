@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
@@ -109,10 +110,62 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
 			// envtest has no garbage collector; remove the owned fleet so
 			// the next spec starts clean.
-			sts := &appsv1.StatefulSet{}
-			if err := k8sClient.Get(ctx, fleetKey, sts); err == nil {
-				Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
+			for _, obj := range []client.Object{
+				&appsv1.StatefulSet{}, &corev1.Service{}, &corev1.ServiceAccount{},
+				&networkingv1.NetworkPolicy{}, &policyv1.PodDisruptionBudget{},
+			} {
+				if err := k8sClient.Get(ctx, fleetKey, obj); err == nil {
+					Expect(k8sClient.Delete(ctx, obj)).To(Succeed())
+				}
 			}
+			internal := &corev1.Service{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceNamespace, Name: resourceName + "-celld-internal"}, internal); err == nil {
+				Expect(k8sClient.Delete(ctx, internal)).To(Succeed())
+			}
+		})
+
+		It("should leave a steady reconcile unchanged and preserve Service metadata", func() {
+			r := reconciler()
+			resource := &platformv1alpha1.WorkerApp{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			resource.Spec.Service.Type = corev1.ServiceTypeNodePort
+			resource.Spec.Bucket.CredentialsFrom.IAMRole = iamRoleAuto
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			sa := &corev1.ServiceAccount{}
+			Expect(k8sClient.Get(ctx, fleetKey, sa)).To(Succeed())
+			sa.Annotations = map[string]string{"eks.amazonaws.com/role-arn": "external-role", "example.com/owner": "platform"}
+			Expect(k8sClient.Update(ctx, sa)).To(Succeed())
+			// The second pass observes the newly created StatefulSet.
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			version := resource.ResourceVersion
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, fleetKey, svc)).To(Succeed())
+			svcVersion, nodePort := svc.ResourceVersion, svc.Spec.Ports[0].NodePort
+			Expect(nodePort).NotTo(BeZero())
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			Expect(resource.ResourceVersion).To(Equal(version))
+			Expect(k8sClient.Get(ctx, fleetKey, svc)).To(Succeed())
+			Expect(svc.ResourceVersion).To(Equal(svcVersion))
+			Expect(svc.Spec.Ports[0].NodePort).To(Equal(nodePort))
+			Expect(k8sClient.Get(ctx, fleetKey, sa)).To(Succeed())
+			Expect(sa.Annotations).To(HaveKeyWithValue("eks.amazonaws.com/role-arn", "external-role"))
+			Expect(sa.Annotations).To(HaveKeyWithValue("example.com/owner", "platform"))
+		})
+
+		It("should refuse to modify an unowned ServiceAccount", func() {
+			sa := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: fleetKey.Name, Namespace: fleetKey.Namespace}}
+			Expect(k8sClient.Create(ctx, sa)).To(Succeed())
+			version := sa.ResourceVersion
+			_, err := reconciler().Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).To(MatchError(ContainSubstring("not controlled by WorkerApp")))
+			Expect(k8sClient.Get(ctx, fleetKey, sa)).To(Succeed())
+			Expect(sa.ResourceVersion).To(Equal(version))
 		})
 
 		It("should reconcile the full fleet", func() {

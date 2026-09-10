@@ -285,6 +285,10 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 		return fleetOutcome{}, err
 	}
 
+	if err := requireOwnership(app, &existing); err != nil {
+		return fleetOutcome{}, err
+	}
+
 	desiredHash := desired.Annotations[templateHashAnnotation]
 	templateChanged := existing.Annotations[templateHashAnnotation] != desiredHash
 	oldImage := stsContainerImage(&existing)
@@ -360,8 +364,8 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 }
 
 // rolloutStep advances a gated rolling update by at most one ordinal.
-// Reconciles arrive at least Requeue apart, so steps are naturally paced —
-// the damper docs/celld-behaviors.md calls settle time.
+// Watch events can reconcile sooner than Requeue; the live gates below,
+// rather than the requeue interval, decide whether another step is safe.
 func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1alpha1.WorkerApp, sts *appsv1.StatefulSet) (fleetOutcome, error) {
 	partition := stsPartition(sts)
 	liveReplicas := ptr.Deref(sts.Spec.Replicas, 0)
