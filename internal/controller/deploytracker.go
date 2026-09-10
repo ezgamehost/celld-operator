@@ -38,10 +38,10 @@ import (
 
 // Deploy tracking closes the loop between `celld deploy` and the rollout:
 // with spec.appVersion "auto", the operator follows the fleet bucket's
-// deploy/current.json — the same pointer celld nodes read at startup — and
+// deploy/current.json — the same pointer celld v0.4 nodes poll in place — and
 // a new publication becomes an ordinary gated rollout with no CR edit.
 // With a pinned appVersion, the same read powers a mismatch warning, since
-// nodes always load what current.json names, not what the CR says.
+// nodes adopt what current.json names, not what the CR says.
 
 // AppVersionAuto is the spec.appVersion sentinel that enables tracking.
 const AppVersionAuto = "auto"

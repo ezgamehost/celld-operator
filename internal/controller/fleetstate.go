@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -157,7 +159,7 @@ func NewStateClient() *StateClient {
 }
 
 func (c *StateClient) Fetch(ctx context.Context, podIP string) (*PodState, error) {
-	url := fmt.Sprintf("http://%s:%d/state", podIP, internalPort)
+	url := "http://" + net.JoinHostPort(podIP, strconv.Itoa(internalPort)) + "/state"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -212,7 +214,7 @@ func (p *StatePoller) NeedLeaderElection() bool { return true }
 func (p *StatePoller) Start(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithName("state-poller")
 	interval := p.Interval
-	if interval == 0 {
+	if interval <= 0 {
 		interval = 15 * time.Second
 	}
 	ticker := time.NewTicker(interval)
@@ -223,7 +225,7 @@ func (p *StatePoller) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			if err := p.sweep(ctx); err != nil {
-				log.Error(err, "fleet state sweep failed")
+				log.Error(err, "Failed to sweep fleet state")
 			}
 		}
 	}
