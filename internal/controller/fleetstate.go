@@ -17,13 +17,21 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
@@ -47,80 +55,46 @@ const (
 	labelPod       = "pod"
 )
 
-var (
-	stateLabels = []string{labelNamespace, labelWorkerApp, labelPod}
-
-	metricResidentCells = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_resident_cells",
-		Help: "Resident (occupied) cells on a fleet pod, from celld /state.",
-	}, stateLabels)
-	metricEvicting = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_evicting",
-		Help: "Cells the pod is currently evicting, from celld /state.",
-	}, stateLabels)
-	metricRestoring = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_restoring",
-		Help: "Cold routes holding or awaiting an activation permit, from celld /state.",
-	}, stateLabels)
-	metricUtilization = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_resident_cell_utilization",
-		Help: "occupied / CELLD_MAX_RESIDENT_CELLS per pod (0..1); the primary autoscaling signal.",
-	}, stateLabels)
-	metricShedding = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_shedding",
-		Help: "1 while the pod reports pressure shedding; the hard out-of-capacity signal.",
-	}, stateLabels)
-	metricUp = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_state_up",
-		Help: "1 if the pod's internal /state endpoint answered the last poll.",
-	}, stateLabels)
-	metricRSSBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_rss_bytes",
-		Help: "Resident set size of the celld process, from /state.",
-	}, stateLabels)
-	metricInUseBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_in_use_bytes",
-		Help: "Process RSS minus allocator retention, from /state.",
-	}, stateLabels)
-	metricCgroupWorkingSetBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_cgroup_working_set_bytes",
-		Help: "Active cgroup memory used by celld's v0.4 pressure threshold, from /state.",
-	}, stateLabels)
-	metricCgroupCurrentBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_cgroup_current_bytes",
-		Help: "Complete cgroup charge used by celld's v0.4 absolute memory cap, from /state.",
-	}, stateLabels)
-	metricRestarts = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_container_restarts",
-		Help: "Kubelet restart count of the celld container; celld relies on the supervisor restarting it after a self-fence.",
-	}, stateLabels)
-	metricSelfFenced = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "celld_self_fenced",
-		Help: "1 if the celld container's last termination was a self-fence (exit code 3): it lost its lease or its storage probe failed.",
-	}, stateLabels)
-)
-
-// selfFenceExitCode is what celld exits with after logging "SELF-FENCE:"
-// (celld docs/fencing.md); the kubelet restarts it, and this is the one
-// signal that distinguishes a fence from any other crash.
-const selfFenceExitCode = 3
-
-func init() {
-	metrics.Registry.MustRegister(
-		metricResidentCells, metricEvicting, metricRestoring,
-		metricUtilization, metricShedding, metricUp,
-		metricRSSBytes, metricInUseBytes,
-		metricCgroupWorkingSetBytes, metricCgroupCurrentBytes,
-		metricRestarts, metricSelfFenced,
-	)
+// A collector publishes immutable snapshots so a scrape cannot observe half
+// of a sweep. Replacing the snapshot also removes deleted pod/fleet series.
+type stateSnapshot struct {
+	mu      sync.RWMutex
+	samples []prometheus.Metric
 }
 
-// PodState is one pod's /state sample. The response schema is celld's alpha
-// operator API (actor.rs state_json): keep parsing tolerant, fail per-pod
-// not per-fleet, and pin operator and celld releases together
-// (docs/celld-behaviors.md). Fields added across releases decode as zero
-// or nil so an older node does not break the whole fleet sweep.
+var fleetMetrics = &stateSnapshot{}
+
+func (s *stateSnapshot) Describe(ch chan<- *prometheus.Desc) { prometheus.DescribeByCollect(s, ch) }
+func (s *stateSnapshot) Collect(ch chan<- prometheus.Metric) {
+	s.mu.RLock()
+	samples := s.samples
+	s.mu.RUnlock()
+	for _, sample := range samples {
+		ch <- sample
+	}
+}
+func (s *stateSnapshot) publish(samples []prometheus.Metric) {
+	s.mu.Lock()
+	s.samples = samples
+	s.mu.Unlock()
+}
+func init() { metrics.Registry.MustRegister(fleetMetrics) }
+
+const selfFenceExitCode = 3
+
+// DeploymentState reports the runtime deployment currently observed on a node.
+type DeploymentState struct {
+	Version    string            `json:"version"`
+	Generation int64             `json:"generation"`
+	Draining   []json.RawMessage `json:"draining"`
+	Swapping   int64             `json:"swapping"`
+}
+
+// PodState is one /state sample. Safety counters are required; optional
+// diagnostic fields remain compatible with older response schemas.
 type PodState struct {
+	Deployment *DeploymentState `json:"deployment"`
+
 	Occupied int64 `json:"occupied"`
 	Evicting int64 `json:"evicting"`
 	// Restoring is state_json's activation backlog: every cold route that
@@ -159,6 +133,8 @@ func NewStateClient() *StateClient {
 }
 
 func (c *StateClient) Fetch(ctx context.Context, podIP string) (*PodState, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	url := "http://" + net.JoinHostPort(podIP, strconv.Itoa(internalPort)) + "/state"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -172,9 +148,35 @@ func (c *StateClient) Fetch(ctx context.Context, podIP string) (*PodState, error
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("/state returned %d", resp.StatusCode)
 	}
-	var state PodState
-	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 4<<20 {
+		return nil, fmt.Errorf("/state exceeds 4 MiB")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
 		return nil, fmt.Errorf("decoding /state: %w", err)
+	}
+	if _, failed := fields["error"]; failed {
+		return nil, fmt.Errorf("/state reports a runtime error")
+	}
+	for _, key := range []string{"occupied", "restoring", "shedding"} {
+		value, present := fields[key]
+		if !present || (key != "shedding" && bytes.Equal(bytes.TrimSpace(value), []byte("null"))) {
+			return nil, fmt.Errorf("/state missing %s", key)
+		}
+	}
+	var state PodState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return nil, fmt.Errorf("decoding /state: %w", err)
+	}
+	if state.Occupied < 0 || state.Restoring < 0 || state.Evicting < 0 {
+		return nil, fmt.Errorf("/state has negative counters")
+	}
+	if d := state.Deployment; d != nil && (d.Version == "" || d.Generation < 1 || d.Swapping < 0) {
+		return nil, fmt.Errorf("invalid deployment state")
 	}
 	return &state, nil
 }
@@ -186,19 +188,28 @@ func (c *StateClient) Fetch(ctx context.Context, podIP string) (*PodState, error
 func (c *StateClient) FleetSweep(ctx context.Context, pods []corev1.Pod) (map[string]*PodState, int64, error) {
 	states := make(map[string]*PodState, len(pods))
 	var restoring int64
+	var mu sync.Mutex
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(16)
 	for i := range pods {
-		pod := &pods[i]
-		if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-		state, err := c.Fetch(ctx, pod.Status.PodIP)
-		if err != nil {
-			return states, restoring, fmt.Errorf("pod %s: %w", pod.Name, err)
-		}
-		states[pod.Name] = state
-		restoring += state.Restoring
+		pod := pods[i]
+		group.Go(func() error {
+			if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning || !pod.DeletionTimestamp.IsZero() {
+				return fmt.Errorf("pod %s is unavailable", pod.Name)
+			}
+			state, err := c.Fetch(groupCtx, pod.Status.PodIP)
+			if err != nil {
+				return fmt.Errorf("pod %s: %w", pod.Name, err)
+			}
+			mu.Lock()
+			states[pod.Name] = state
+			restoring += state.Restoring
+			mu.Unlock()
+			return nil
+		})
 	}
-	return states, restoring, nil
+	err := group.Wait()
+	return states, restoring, err
 }
 
 // StatePoller is a manager Runnable that continuously exports fleet metrics.
@@ -212,6 +223,7 @@ type StatePoller struct {
 func (p *StatePoller) NeedLeaderElection() bool { return true }
 
 func (p *StatePoller) Start(ctx context.Context) error {
+	defer fleetMetrics.publish(nil)
 	log := logf.FromContext(ctx).WithName("state-poller")
 	interval := p.Interval
 	if interval <= 0 {
@@ -232,68 +244,68 @@ func (p *StatePoller) Start(ctx context.Context) error {
 }
 
 func (p *StatePoller) sweep(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	var apps platformv1alpha1.WorkerAppList
 	if err := p.Client.List(ctx, &apps); err != nil {
 		return err
 	}
-	// Reset then repopulate: pods and fleets come and go, and stale series
-	// would keep autoscaling on dead data. Single writer (leader-only).
-	metricResidentCells.Reset()
-	metricEvicting.Reset()
-	metricRestoring.Reset()
-	metricUtilization.Reset()
-	metricShedding.Reset()
-	metricUp.Reset()
-	metricRSSBytes.Reset()
-	metricInUseBytes.Reset()
-	metricCgroupWorkingSetBytes.Reset()
-	metricCgroupCurrentBytes.Reset()
-	metricRestarts.Reset()
-	metricSelfFenced.Reset()
-
+	var samples []prometheus.Metric
+	add := func(name string, value float64, labels ...string) {
+		keys := []string{labelNamespace, labelWorkerApp}
+		if len(labels) == 3 {
+			keys = append(keys, labelPod)
+		}
+		samples = append(samples, prometheus.MustNewConstMetric(prometheus.NewDesc(name, name, keys, nil), prometheus.GaugeValue, value, labels...))
+	}
 	for i := range apps.Items {
 		app := &apps.Items[i]
+		sampledAt := time.Now()
+		var sts appsv1.StatefulSet
 		var pods corev1.PodList
-		if err := p.Client.List(ctx, &pods,
-			client.InNamespace(app.Namespace),
-			client.MatchingLabels(selectorLabels(app))); err != nil {
-			return err
+		err := p.Client.Get(ctx, client.ObjectKey{Namespace: app.Namespace, Name: fleetName(app)}, &sts)
+		if err == nil {
+			err = p.Client.List(ctx, &pods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app)))
 		}
-		maxCells := float64(maxResidentCells(app))
+		complete := err == nil && ptr.Deref(sts.Spec.Replicas, 0) > 0 && int32(len(pods.Items)) == ptr.Deref(sts.Spec.Replicas, 0) && sts.Status.ObservedGeneration == sts.Generation
+		for j := range pods.Items {
+			if !metav1.IsControlledBy(&pods.Items[j], &sts) || !podReady(&pods.Items[j]) {
+				complete = false
+			}
+		}
+		states, _, sweepErr := p.State.FleetSweep(ctx, pods.Items)
+		complete = complete && sweepErr == nil && len(states) == len(pods.Items)
+		add("celld_fleet_complete", boolToGauge(complete), app.Namespace, app.Name)
+		add("celld_fleet_sample_timestamp_seconds", float64(sampledAt.Unix()), app.Namespace, app.Name)
 		for j := range pods.Items {
 			pod := &pods.Items[j]
-			if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
+			labels := []string{app.Namespace, app.Name, pod.Name}
+			restarts, fenced := celldRestarts(pod)
+			add("celld_container_restarts", float64(restarts), labels...)
+			add("celld_self_fenced", boolToGauge(fenced), labels...)
+			state, up := states[pod.Name]
+			add("celld_state_up", boolToGauge(up), labels...)
+			if !up {
 				continue
 			}
-			labels := prometheus.Labels{
-				labelNamespace: app.Namespace, labelWorkerApp: app.Name, labelPod: pod.Name,
-			}
-			// Restart bookkeeping comes from the pod, not /state, so it is
-			// reported even while the node is down (F12).
-			restarts, selfFenced := celldRestarts(pod)
-			metricRestarts.With(labels).Set(float64(restarts))
-			metricSelfFenced.With(labels).Set(boolToGauge(selfFenced))
-			state, err := p.State.Fetch(ctx, pod.Status.PodIP)
-			if err != nil {
-				metricUp.With(labels).Set(0)
-				continue
-			}
-			metricUp.With(labels).Set(1)
-			metricResidentCells.With(labels).Set(float64(state.Occupied))
-			metricEvicting.With(labels).Set(float64(state.Evicting))
-			metricRestoring.With(labels).Set(float64(state.Restoring))
-			metricUtilization.With(labels).Set(float64(state.Occupied) / maxCells)
-			metricShedding.With(labels).Set(boolToGauge(state.IsShedding()))
-			metricRSSBytes.With(labels).Set(float64(state.RSSBytes))
-			metricInUseBytes.With(labels).Set(float64(state.InUseBytes))
-			if state.CgroupWorkingSetBytes != nil {
-				metricCgroupWorkingSetBytes.With(labels).Set(float64(*state.CgroupWorkingSetBytes))
+			values := map[string]float64{
+				"celld_resident_cells": float64(state.Occupied), "celld_evicting": float64(state.Evicting),
+				"celld_restoring": float64(state.Restoring), "celld_shedding": boolToGauge(state.IsShedding()),
+				"celld_resident_cell_utilization": float64(state.Occupied) / float64(maxResidentCells(app)),
+				"celld_rss_bytes":                 float64(state.RSSBytes), "celld_in_use_bytes": float64(state.InUseBytes),
 			}
 			if state.CgroupCurrentBytes != nil {
-				metricCgroupCurrentBytes.With(labels).Set(float64(*state.CgroupCurrentBytes))
+				values["celld_cgroup_current_bytes"] = float64(*state.CgroupCurrentBytes)
+			}
+			if state.CgroupWorkingSetBytes != nil {
+				values["celld_cgroup_working_set_bytes"] = float64(*state.CgroupWorkingSetBytes)
+			}
+			for name, value := range values {
+				add(name, value, labels...)
 			}
 		}
 	}
+	fleetMetrics.publish(samples)
 	return nil
 }
 

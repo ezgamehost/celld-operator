@@ -27,3 +27,6 @@ jobs:
         run: |
           go mod tidy
           make test
+          make chart-sync
+          git diff --exit-code -- config/crd config/rbac dist/chart
+          (cd cmd && go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 -scan=module)

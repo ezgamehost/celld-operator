@@ -19,9 +19,13 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
+
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -117,11 +121,33 @@ func main() {
 	var deployPollInterval time.Duration
 	flag.DurationVar(&deployPollInterval, "deploy-poll-interval", 60*time.Second,
 		"How often fleet buckets' deploy/current.json is polled for appVersion \"auto\" tracking.")
+	var watchNamespace, imagePrefixes, iamRoles, azureIDs, bucketEndpoints string
+	var routeRetries bool
+	flag.StringVar(&watchNamespace, "watch-namespace", "",
+		"Restrict reconciliation to this namespace; pair with namespaced RBAC.")
+	flag.StringVar(&imagePrefixes, "allowed-image-prefixes", "ghcr.io/denoland/celld:",
+		"Comma-separated allowed image prefixes.")
+	flag.StringVar(&iamRoles, "allowed-iam-roles", "", "Comma-separated allowed IAM role ARNs.")
+	flag.StringVar(&azureIDs, "allowed-azure-client-ids", "", "Comma-separated allowed Azure workload identities.")
+	flag.StringVar(&bucketEndpoints, "allowed-bucket-endpoints", "",
+		"Allowed HTTPS storage endpoints; empty permits AWS S3 only.")
+	flag.BoolVar(&routeRetries, "httproute-retries", false,
+		"Requires experimental Gateway API CRDs.")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+	validModes := []string{controller.IngressModeHTTPRoute, controller.IngressModeIngress,
+		controller.IngressModeVirtualService, controller.IngressModeNone}
+	if !slices.Contains(validModes, ingressMode) || statePollInterval <= 0 || deployPollInterval <= 0 {
+		fmt.Fprintln(os.Stderr, "Invalid ingress mode or nonpositive poll interval")
+		os.Exit(1)
+	}
+	cacheOptions := cache.Options{}
+	if watchNamespace != "" {
+		cacheOptions.DefaultNamespaces = map[string]cache.Config{watchNamespace: {}}
+	}
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
@@ -194,6 +220,7 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
+		Cache:                  cacheOptions,
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
@@ -203,7 +230,9 @@ func main() {
 		// rollouts) but must not be cached: a cached read would start a
 		// cluster-wide Secret informer and hold every Secret in memory.
 		Client: client.Options{
-			Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}}},
+			Cache: &client.CacheOptions{DisableFor: []client.Object{
+				&corev1.Secret{}, &gatewayv1.HTTPRoute{},
+			}},
 		},
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
@@ -228,19 +257,24 @@ func main() {
 		istioGatewayList = strings.Split(istioGateways, ",")
 	}
 	if err := (&controller.WorkerAppReconciler{
-		Client:            mgr.GetClient(),
-		Scheme:            mgr.GetScheme(),
-		State:             stateClient,
-		Deploys:           controller.NewDeployTracker(deployPollInterval),
-		IngressMode:       ingressMode,
-		IstioGateways:     istioGatewayList,
-		IngressClassName:  ingressClass,
-		ClusterIssuer:     clusterIssuer,
-		GatewayName:       gatewayName,
-		GatewayNamespace:  gatewayNamespace,
-		PrometheusURL:     prometheusURL,
-		OperatorNamespace: operatorNamespace,
-		OperatorPrincipal: operatorPrincipal,
+		AllowedImagePrefixes:   splitList(imagePrefixes),
+		AllowedIAMRoles:        splitList(iamRoles),
+		AllowedAzureClientIDs:  splitList(azureIDs),
+		AllowedBucketEndpoints: splitList(bucketEndpoints),
+		HTTPRouteRetries:       routeRetries,
+		Client:                 mgr.GetClient(),
+		Scheme:                 mgr.GetScheme(),
+		State:                  stateClient,
+		Deploys:                controller.NewDeployTracker(deployPollInterval),
+		IngressMode:            ingressMode,
+		IstioGateways:          istioGatewayList,
+		IngressClassName:       ingressClass,
+		ClusterIssuer:          clusterIssuer,
+		GatewayName:            gatewayName,
+		GatewayNamespace:       gatewayNamespace,
+		PrometheusURL:          prometheusURL,
+		OperatorNamespace:      operatorNamespace,
+		OperatorPrincipal:      operatorPrincipal,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "workerapp")
 		os.Exit(1)
@@ -271,4 +305,14 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+func splitList(value string) []string {
+	var result []string
+	for item := range strings.SplitSeq(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
 }

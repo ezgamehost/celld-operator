@@ -45,6 +45,9 @@ import (
 
 const (
 	celldContainerName = "celld"
+	watchVolumeName    = "watch"
+	varsVolumeName     = "vars"
+	annotationTrue     = "true"
 
 	// iamRoleAuto asks the operator to provision the role (not implemented;
 	// surfaced as a condition).
@@ -150,9 +153,10 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 	// changes. It stays under celld's own absolute RSS cap (95% of the
 	// limit), so the cell-memory threshold keeps the recovery property of
 	// shedding (docs/celld-behaviors.md F10).
-	rssMb := memGi * 1024 * 4 / 5
+	rssMb := int64(memGi) * 1024 * 4 / 5
 
 	env := []corev1.EnvVar{
+		{Name: "HOME", Value: "/tmp"},
 		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
 		}},
@@ -161,8 +165,8 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		// Stable per-pod DNS via the headless service; peers resolve it to
 		// the internal listener (F2).
 		{Name: "CELLD_ADVERTISE", Value: fmt.Sprintf(
-			"$(POD_NAME).%s.%s.svc.cluster.local:%d",
-			internalServiceName(app), app.Namespace, internalPort)},
+			"$(POD_NAME).%s.%s.svc.%s:%d",
+			internalServiceName(app), app.Namespace, clusterDomain(app), internalPort)},
 		{Name: "CELLD_WATCH", Value: watchDir},
 		{Name: "CELLD_SHUTDOWN_DRAIN_MS", Value: fmt.Sprintf("%d", shutdownDrainMs)},
 		{Name: "CELLD_SHUTDOWN_TOTAL_MS", Value: fmt.Sprintf("%d", shutdownTotalMs)},
@@ -182,10 +186,14 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		// field for az://, so the pod spec is the one source of truth.
 		env = append(env, corev1.EnvVar{Name: "AZURE_STORAGE_ACCOUNT_NAME", Value: app.Spec.Bucket.StorageAccount})
 	}
-	if app.Spec.Durability != "" {
+	durability := app.Spec.Durability
+	if durability == "" {
+		durability = platformv1alpha1.DurabilityBucket
+	}
+	if durability != "" {
 		// Unset keeps celld's default (fleet since v0.3.0), so the fleet
 		// follows upstream unless the CR pins a proof (F13).
-		env = append(env, corev1.EnvVar{Name: "CELLD_DURABILITY", Value: string(app.Spec.Durability)})
+		env = append(env, corev1.EnvVar{Name: "CELLD_DURABILITY", Value: string(durability)})
 	}
 	if app.Spec.TrustForwardedHeaders {
 		// Off unless asked: celld reads the last value of each header, so
@@ -213,19 +221,19 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 	}
 
 	volumes := []corev1.Volume{{
-		Name:         "watch",
+		Name:         watchVolumeName,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 	}}
-	mounts := []corev1.VolumeMount{{Name: "watch", MountPath: watchDir}}
+	mounts := []corev1.VolumeMount{{Name: watchVolumeName, MountPath: watchDir}}
 
 	if app.Spec.Vars != nil {
 		volumes = append(volumes, corev1.Volume{
-			Name: "vars",
+			Name: varsVolumeName,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 				SecretName: app.Spec.Vars.SecretRef,
 			}},
 		})
-		mounts = append(mounts, corev1.VolumeMount{Name: "vars", MountPath: varsDir, ReadOnly: true})
+		mounts = append(mounts, corev1.VolumeMount{Name: varsVolumeName, MountPath: varsDir, ReadOnly: true})
 		env = append(env, corev1.EnvVar{Name: "CELLD_VARS_FILE", Value: varsDir + "/" + varsKey})
 	}
 
@@ -238,9 +246,16 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		})
 	}
 
+	if app.Spec.Storage != nil {
+		volumes = volumes[1:]
+	}
+	volumes = append(volumes, corev1.Volume{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+	mounts = append(mounts, corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"})
 	container := corev1.Container{
-		Name:  celldContainerName,
-		Image: app.Spec.Celld.Image,
+		SecurityContext: &corev1.SecurityContext{AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}},
+		StartupProbe:    &corev1.Probe{ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(publicPort)}}, PeriodSeconds: 5, FailureThreshold: 120},
+		Name:            celldContainerName,
+		Image:           app.Spec.Celld.Image,
 		Args: []string{
 			"--bucket", app.Spec.Bucket.Name,
 			"--listen", fmt.Sprintf("0.0.0.0:%d", publicPort),
@@ -274,18 +289,19 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("500m"),
+				corev1.ResourceCPU:    *resource.NewMilliQuantity(int64(defaultPositive(app.Spec.Resources.CPUMillis, 500)), resource.DecimalSI),
 				corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dGi", memGi)),
 			},
 			Limits: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dGi", memGi)),
+				corev1.ResourceEphemeralStorage: resource.MustParse(fmt.Sprintf("%dGi", defaultPositive(app.Spec.Resources.EphemeralStorageGi, 10))),
+				corev1.ResourceMemory:           resource.MustParse(fmt.Sprintf("%dGi", memGi)),
 			},
 		},
 		VolumeMounts: mounts,
 	}
 
 	annotations := map[string]string{}
-	if appVersion != "" {
+	if appVersion != "" && app.Spec.DeploymentPolicy != "InPlace" {
 		// The declarative rollout trigger (F4): `celld deploy` publishes
 		// to the bucket, then this annotation changing (a spec bump, or
 		// the tracked pointer moving) rolls the fleet so nodes restart
@@ -300,7 +316,7 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 	if app.Spec.Bucket.CredentialsFrom.AzureClientID != "" {
 		// Pod-only label (never part of the selector): it is what makes
 		// the AKS webhook mutate the pod.
-		labels[azureWorkloadIdentityUseLabel] = "true"
+		labels[azureWorkloadIdentityUseLabel] = annotationTrue
 	}
 
 	return corev1.PodTemplateSpec{
@@ -309,6 +325,11 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken:  ptr.To(false),
+			SecurityContext:               &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true), RunAsUser: ptr.To(int64(10001)), RunAsGroup: ptr.To(int64(10001)), FSGroup: ptr.To(int64(10001)), SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}},
+			NodeSelector:                  app.Spec.Scheduling.NodeSelector,
+			Tolerations:                   app.Spec.Scheduling.Tolerations,
+			Affinity:                      fleetAffinity(app),
 			ServiceAccountName:            fleetName(app),
 			TerminationGracePeriodSeconds: ptr.To(int64(terminationGraceS)),
 			Containers:                    []corev1.Container{container},
@@ -355,10 +376,12 @@ func buildStatefulSet(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 			},
 		},
 		Spec: appsv1.StatefulSetSpec{
-			ServiceName: internalServiceName(app),
-			Replicas:    ptr.To(desiredReplicas(app)),
-			Selector:    &metav1.LabelSelector{MatchLabels: selectorLabels(app)},
-			Template:    template,
+			VolumeClaimTemplates:                 fleetClaims(app),
+			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType, WhenScaled: appsv1.RetainPersistentVolumeClaimRetentionPolicyType},
+			ServiceName:                          internalServiceName(app),
+			Replicas:                             ptr.To(desiredReplicas(app)),
+			Selector:                             &metav1.LabelSelector{MatchLabels: selectorLabels(app)},
+			Template:                             template,
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.RollingUpdateStatefulSetStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{
@@ -460,7 +483,7 @@ func buildNetworkPolicy(app *platformv1alpha1.WorkerApp, operatorNamespace strin
 					}},
 					From: []networkingv1.NetworkPolicyPeer{
 						{PodSelector: &metav1.LabelSelector{MatchLabels: selectorLabels(app)}},
-						{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"control-plane": "controller-manager", "app.kubernetes.io/name": "celld-operator"}}, NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 							"kubernetes.io/metadata.name": operatorNamespace,
 						}}},
 					},
@@ -654,7 +677,7 @@ func buildVirtualService(app *platformv1alpha1.WorkerApp, gateways []string) *un
 			"gateways": gws,
 			"http": []any{map[string]any{
 				"route": []any{map[string]any{"destination": map[string]any{
-					"host": fmt.Sprintf("%s.%s.svc.cluster.local", fleetName(app), app.Namespace),
+					"host": fmt.Sprintf("%s.%s.svc.%s", fleetName(app), app.Namespace, clusterDomain(app)),
 					"port": map[string]any{"number": int64(publicPort)},
 				}}},
 				"retries": map[string]any{
@@ -731,9 +754,14 @@ func buildScaledObject(app *platformv1alpha1.WorkerApp, prometheusURL string, pa
 	}
 	if as.Targets.P95LatencyMs != nil {
 		triggers = append(triggers, promTrigger(prometheusURL,
-			fmt.Sprintf(`histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{destination_service_name=%q,reporter="destination"}[5m])) by (le))`,
-				fleetName(app)),
+			fmt.Sprintf(`histogram_quantile(0.95, sum(rate(istio_request_duration_milliseconds_bucket{destination_service_name=%q,destination_service_namespace=%q,reporter="destination"}[5m])) by (le))`,
+				fleetName(app), app.Namespace),
 			fmt.Sprintf("%d", *as.Targets.P95LatencyMs)))
+	}
+
+	for _, trigger := range triggers {
+		metadata := trigger.(map[string]any)["metadata"].(map[string]any)
+		metadata["query"] = fmt.Sprintf("(%s) and on() (min(celld_fleet_complete{namespace=%q,workerapp=%q}) == 1) and on() (time() - min(celld_fleet_sample_timestamp_seconds{namespace=%q,workerapp=%q}) < 60)", metadata["query"], app.Namespace, app.Name, app.Namespace, app.Name)
 	}
 
 	// Scale down slowly and one pod at a time: removing a pod hands off its
@@ -784,9 +812,10 @@ func promTrigger(serverAddress, query, threshold string) map[string]any {
 		"type":       "prometheus",
 		"metricType": "Value",
 		"metadata": map[string]any{
-			"serverAddress": serverAddress,
-			"query":         query,
-			"threshold":     threshold,
+			"serverAddress":    serverAddress,
+			"query":            query,
+			"threshold":        threshold,
+			"ignoreNullValues": "false",
 		},
 	}
 }
@@ -797,4 +826,37 @@ func toAnyMap(in map[string]string) map[string]any {
 		out[k] = v
 	}
 	return out
+}
+
+func clusterDomain(app *platformv1alpha1.WorkerApp) string {
+	if app.Spec.ClusterDomain != "" {
+		return app.Spec.ClusterDomain
+	}
+	return "cluster.local"
+}
+func defaultPositive(value, fallback int32) int32 {
+	if value > 0 {
+		return value
+	}
+	return fallback
+}
+func fleetAffinity(app *platformv1alpha1.WorkerApp) *corev1.Affinity {
+	if app.Spec.Storage == nil {
+		return nil
+	}
+	keys := []string{"kubernetes.io/hostname"}
+	if app.Spec.Scheduling.SpreadAcrossZones {
+		keys = append(keys, "topology.kubernetes.io/zone")
+	}
+	terms := make([]corev1.PodAffinityTerm, 0, len(keys))
+	for _, key := range keys {
+		terms = append(terms, corev1.PodAffinityTerm{TopologyKey: key, LabelSelector: &metav1.LabelSelector{MatchLabels: selectorLabels(app)}})
+	}
+	return &corev1.Affinity{PodAntiAffinity: &corev1.PodAntiAffinity{RequiredDuringSchedulingIgnoredDuringExecution: terms}}
+}
+func fleetClaims(app *platformv1alpha1.WorkerApp) []corev1.PersistentVolumeClaim {
+	if app.Spec.Storage == nil {
+		return nil
+	}
+	return []corev1.PersistentVolumeClaim{{ObjectMeta: metav1.ObjectMeta{Name: watchVolumeName}, Spec: corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, StorageClassName: app.Spec.Storage.StorageClassName, Resources: corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(fmt.Sprintf("%dGi", app.Spec.Storage.SizeGi))}}}}}
 }

@@ -64,12 +64,9 @@ spec:
             properties:
               appVersion:
                 description: |-
-                  appVersion names the application deployment in the fleet bucket
-                  (written there by `celld deploy`). Nodes load a deployment at startup
-                  only, so changing this triggers the gated rollout (docs/celld-behaviors.md).
-                  The sentinel "auto" makes the operator follow the bucket's
-                  deploy/current.json instead: `celld deploy` alone rolls the fleet,
-                  within one poll interval, with no CR edit.
+                  appVersion is the expected deployment, not a runtime pin: celld v0.4
+                  adopts the bucket pointer in place. auto reads the pointer using the
+                  dedicated tracking credential. Status verifies live node versions.
                 minLength: 1
                 type: string
               autoscaling:
@@ -80,6 +77,7 @@ spec:
                   scaler and the partition controller never fight over replica count.
                 properties:
                   enabled:
+                    default: false
                     type: boolean
                   maxReplicas:
                     default: 10
@@ -119,6 +117,9 @@ spec:
                         type: integer
                     type: object
                 type: object
+                x-kubernetes-validations:
+                - message: minReplicas must not exceed maxReplicas
+                  rule: self.minReplicas <= self.maxReplicas
               bucket:
                 description: BucketSpec locates the fleet's slice of the object store.
                 properties:
@@ -147,8 +148,14 @@ spec:
                           AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for an s3:// bucket, or
                           AZURE_STORAGE_ACCOUNT_KEY for an az:// container. For stores where
                           identity-based auth is unavailable.
+                        minLength: 1
                         type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: select at most one credential family
+                      rule: '[has(self.iamRole) && self.iamRole.size() > 0, has(self.secretRef)
+                        && self.secretRef.size() > 0, has(self.azureClientID) && self.azureClientID.size()
+                        > 0].filter(x, x).size() <= 1'
                   endpoint:
                     description: |-
                       endpoint is the S3-compatible endpoint URL, when not AWS S3.
@@ -164,7 +171,7 @@ spec:
                       contract (conditional create/overwrite, read-after-write); see
                       docs/celld-behaviors.md for the qualified list.
                     maxLength: 1024
-                    pattern: ^(s3|gs|az)://.+
+                    pattern: ^(s3|gs|az)://[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9._/-]+)?$
                     type: string
                   region:
                     description: region is the storage region, when it cannot be inferred.
@@ -189,13 +196,22 @@ spec:
                 - message: endpoint applies to s3:// buckets only; celld rejects an
                     endpoint for gs:// and az://
                   rule: '!has(self.endpoint) || self.endpoint.size() == 0 || self.name.startsWith(''s3://'')'
+                - message: bucket identity is immutable; migrate to a new WorkerApp
+                  rule: self.name == oldSelf.name
+                - message: storage account is immutable
+                  rule: has(self.storageAccount) == has(oldSelf.storageAccount) &&
+                    (!has(self.storageAccount) || self.storageAccount == oldSelf.storageAccount)
+                - message: bucket endpoint is immutable
+                  rule: has(self.endpoint) == has(oldSelf.endpoint) && (!has(self.endpoint)
+                    || self.endpoint == oldSelf.endpoint)
               celld:
                 description: CelldSpec pins the celld runtime for the fleet.
                 properties:
                   image:
                     description: |-
-                      image is the celld container image, tag included. Mixed-version fleets
-                      are never created; changing this triggers the strategy below.
+                      image is an explicitly versioned celld image. Known incompatible versions
+                      require Recreate; compatible releases roll one pod at a time.
+                    minLength: 1
                     type: string
                   updateStrategy:
                     default: Rolling
@@ -208,12 +224,32 @@ spec:
                 required:
                 - image
                 type: object
+              clusterDomain:
+                default: cluster.local
+                description: clusterDomain is the Kubernetes DNS suffix.
+                pattern: ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$
+                type: string
+              deployTrackingSecretRef:
+                description: |-
+                  deployTrackingSecretRef is a dedicated read-only S3 credential for
+                  deploy/current.json. The operator never uses its ambient cloud identity.
+                minLength: 1
+                type: string
+              deploymentPolicy:
+                default: Restart
+                description: deploymentPolicy selects adoption in place or an additional
+                  gated restart.
+                enum:
+                - Restart
+                - InPlace
+                type: string
               durability:
+                default: bucket
                 description: |-
                   durability selects how celld proves a write before acknowledging it:
                   fleet (celld's default: two follower nodes fsync it, the bucket
                   upload follows) or bucket (the write is in the bucket first). Unset
-                  leaves celld's default. Changing it restarts the fleet through the
+                  selects bucket acknowledgement for safety with ephemeral storage. Changing it restarts the fleet through the
                   ordinary gated rollout.
                 enum:
                 - fleet
@@ -245,6 +281,18 @@ spec:
                   applies that threshold to the memory its cells hold and keeps its own
                   absolute cap at 95% of the limit on the process RSS (docs/celld-behaviors.md F10).
                 properties:
+                  cpuMillis:
+                    default: 500
+                    description: cpuMillis is the CPU request per pod.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  ephemeralStorageGi:
+                    default: 10
+                    description: ephemeralStorageGi bounds writable temporary storage.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   maxResidentCells:
                     default: 1000
                     description: |-
@@ -258,8 +306,60 @@ spec:
                     description: memoryGi is the container memory limit per pod, in
                       GiB.
                     format: int32
+                    maximum: 65536
                     minimum: 1
                     type: integer
+                type: object
+              scheduling:
+                description: |-
+                  SchedulingSpec controls placement. Persistent fleets always require distinct
+                  hosts; spreadAcrossZones additionally requires distinct zones.
+                properties:
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  spreadAcrossZones:
+                    type: boolean
+                  tolerations:
+                    items:
+                      description: |-
+                        The pod this Toleration is attached to tolerates any taint that matches
+                        the triple <key,value,effect> using the matching operator <operator>.
+                      properties:
+                        effect:
+                          description: |-
+                            Effect indicates the taint effect to match. Empty means match all taint effects.
+                            When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                          type: string
+                        key:
+                          description: |-
+                            Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                            If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                          type: string
+                        operator:
+                          description: |-
+                            Operator represents a key's relationship to the value.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                            Exists is equivalent to wildcard for value, so that a pod can
+                            tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                          type: string
+                        tolerationSeconds:
+                          description: |-
+                            TolerationSeconds represents the period of time the toleration (which must be
+                            of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                            it is not set, which means tolerate the taint forever (do not evict). Zero and
+                            negative values will be treated as 0 (evict immediately) by the system.
+                          format: int64
+                          type: integer
+                        value:
+                          description: |-
+                            Value is the taint value the toleration matches to.
+                            If the operator is Exists, the value should be empty, otherwise just a regular string.
+                          type: string
+                      type: object
+                    type: array
                 type: object
               service:
                 description: |-
@@ -283,6 +383,21 @@ spec:
                     - LoadBalancer
                     - NodePort
                     type: string
+                type: object
+              storage:
+                description: |-
+                  StorageSpec provisions retained local state per ordinal. Changing storage
+                  configuration requires a new WorkerApp; existing PVCs are never deleted.
+                properties:
+                  sizeGi:
+                    format: int32
+                    maximum: 65536
+                    minimum: 1
+                    type: integer
+                  storageClassName:
+                    type: string
+                required:
+                - sizeGi
                 type: object
               telemetry:
                 description: TelemetrySpec controls celld's built-in tracing (CELLD_OTEL).
@@ -331,6 +446,7 @@ spec:
                       secretRef names a Secret whose data is mounted and passed via
                       CELLD_VARS_FILE. Rotation is a Secret update plus an ordinary gated
                       rollout; values are never baked into bundles.
+                    minLength: 1
                     type: string
                 required:
                 - secretRef
@@ -347,6 +463,18 @@ spec:
             - bucket
             - celld
             type: object
+            x-kubernetes-validations:
+            - message: auto requires an s3 bucket and a deployTrackingSecretRef
+              rule: self.appVersion != 'auto' || (self.bucket.name.startsWith('s3://')
+                && has(self.deployTrackingSecretRef))
+            - message: fleet durability requires persistent storage and at least three
+                replicas
+              rule: '!has(self.durability) || self.durability != ''fleet'' || (has(self.storage)
+                && self.replicas >= 3 && (!has(self.autoscaling) || !self.autoscaling.enabled
+                || self.autoscaling.minReplicas >= 3))'
+            - message: storage is immutable; migrate to a new WorkerApp
+              rule: has(self.storage) == has(oldSelf.storage) && (!has(self.storage)
+                || self.storage == oldSelf.storage)
           status:
             description: status defines the observed state of WorkerApp
             properties:
@@ -411,6 +539,39 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              deployments:
+                description: deployments are fresh observations; missing nodes are
+                  not inferred.
+                items:
+                  description: PodDeployment reports a live node's adoption state.
+                  properties:
+                    draining:
+                      format: int32
+                      type: integer
+                    generation:
+                      format: int64
+                      type: integer
+                    name:
+                      type: string
+                    swapping:
+                      format: int64
+                      type: integer
+                    version:
+                      type: string
+                  required:
+                  - draining
+                  - generation
+                  - name
+                  - swapping
+                  - version
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+              expectedAppVersion:
+                description: expectedAppVersion is the resolved deployment target.
+                type: string
               fleet:
                 description: |-
                   FleetStatus aggregates the per-pod /state the operator polls. The fields
@@ -462,6 +623,9 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: WorkerApp name must not exceed 48 characters
+          rule: size(self.metadata.name) <= 48
     served: true
     storage: true
     subresources:

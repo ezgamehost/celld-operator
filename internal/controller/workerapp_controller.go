@@ -18,9 +18,11 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -72,6 +74,13 @@ const (
 // around the unauthenticated internal listener, the PDB, the HTTPRoute on
 // the shared Gateway, and the KEDA ScaledObject (docs/celld-behaviors.md).
 type WorkerAppReconciler struct {
+	AllowedImagePrefixes   []string
+	AllowedIAMRoles        []string
+	AllowedAzureClientIDs  []string
+	AllowedBucketEndpoints []string
+	// HTTPRouteRetries must be enabled only with experimental Gateway API CRDs.
+	HTTPRouteRetries bool
+
 	client.Client
 	Scheme *runtime.Scheme
 	State  *StateClient
@@ -113,6 +122,7 @@ type WorkerAppReconciler struct {
 // +kubebuilder:rbac:groups=celld-operator.io,resources=workerapps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=celld-operator.io,resources=workerapps/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=celld-operator.io,resources=workerapps/finalizers,verbs=update
+// +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services;serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -120,6 +130,7 @@ type WorkerAppReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies;ingresses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=keda.sh,resources=scaledobjects,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=security.istio.io,resources=authorizationpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -127,19 +138,38 @@ type WorkerAppReconciler struct {
 
 // Reconcile drives one WorkerApp toward its spec.
 func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
 	log := logf.FromContext(ctx)
 
 	app := &platformv1alpha1.WorkerApp{}
 	if err := r.Get(ctx, req.NamespacedName, app); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.Deploys.Forget(req.NamespacedName)
+		}
 		// Deleted: children are owned and garbage-collected.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	if !app.DeletionTimestamp.IsZero() {
+		r.Deploys.Forget(req.NamespacedName)
 		return ctrl.Result{}, nil
 	}
 
-	var conditions []metav1.Condition
+	conditions := make([]metav1.Condition, 0, 8)
+	if err := r.validateApp(app); err != nil {
+		condition := metav1.Condition{Type: "SpecValid", Status: metav1.ConditionFalse, Reason: "InvalidConfiguration", Message: err.Error(), ObservedGeneration: app.Generation}
+		before := app.DeepCopy()
+		meta.SetStatusCondition(&app.Status.Conditions, condition)
+		app.Status.Phase = platformv1alpha1.PhaseDegraded
+		app.Status.RolledOutAppVersion = ""
+		meta.SetStatusCondition(&app.Status.Conditions, metav1.Condition{Type: "Available", Status: metav1.ConditionFalse, Reason: "InvalidConfiguration", ObservedGeneration: app.Generation})
+		if !apiequality.Semantic.DeepEqual(before.Status, app.Status) {
+			return ctrl.Result{}, r.Status().Update(ctx, app)
+		}
+		return ctrl.Result{RequeueAfter: time.Minute}, nil
+	}
+	conditions = append(conditions, metav1.Condition{Type: "SpecValid", Status: metav1.ConditionTrue, Reason: "Validated"})
 
 	// Foundation objects first: the StatefulSet references the service
 	// account and headless service by name.
@@ -247,7 +277,7 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 		l.Spec.Type = d.Spec.Type
 		// Cloud LB configuration rides on annotations; merge so the cloud
 		// controller's own bookkeeping annotations survive.
-		l.SetAnnotations(mergeStringMaps(l.GetAnnotations(), d.GetAnnotations()))
+		reconcileAnnotations(l, d.GetAnnotations())
 	}); err != nil {
 		return fmt.Errorf("public service: %w", err)
 	}
@@ -278,6 +308,12 @@ func (r *WorkerAppReconciler) ensureFoundation(ctx context.Context, app *platfor
 // objects, and unconditional writes amplify every pod-churn burst into an
 // apiserver write storm.
 func (r *WorkerAppReconciler) ensureObject(ctx context.Context, app *platformv1alpha1.WorkerApp, desired client.Object, mutate func(live, desired client.Object)) error {
+	if _, ok := desired.(*corev1.Service); ok {
+		reconcileAnnotations(desired, desired.GetAnnotations())
+	}
+	if _, ok := desired.(*networkingv1.Ingress); ok {
+		reconcileAnnotations(desired, desired.GetAnnotations())
+	}
 	if err := ctrl.SetControllerReference(app, desired, r.Scheme); err != nil {
 		return err
 	}
@@ -313,6 +349,10 @@ func requireOwnership(app *platformv1alpha1.WorkerApp, obj client.Object) error 
 // fast requeue (anything but a missing CRD, which only changes when a
 // human installs something).
 func (r *WorkerAppReconciler) ensureIngress(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
+	if err := r.removeObsoleteRoutes(ctx, app); err != nil {
+		*conditions = append(*conditions, metav1.Condition{Type: condIngressReady, Status: metav1.ConditionFalse, Reason: reasonRouteError, Message: err.Error()})
+		return true
+	}
 	if len(app.Spec.Hostnames) == 0 {
 		return false
 	}
@@ -335,7 +375,7 @@ func (r *WorkerAppReconciler) ensureV1Ingress(ctx context.Context, app *platform
 		l.Spec = d.Spec
 		// Annotations carry the route policy; merge so other controllers'
 		// bookkeeping survives.
-		l.SetAnnotations(mergeStringMaps(l.GetAnnotations(), d.GetAnnotations()))
+		reconcileAnnotations(l, d.GetAnnotations())
 	})
 	if err != nil {
 		*conditions = append(*conditions, metav1.Condition{
@@ -345,7 +385,7 @@ func (r *WorkerAppReconciler) ensureV1Ingress(ctx context.Context, app *platform
 		return true
 	}
 	*conditions = append(*conditions, metav1.Condition{
-		Type: condIngressReady, Status: metav1.ConditionTrue, Reason: "IngressReconciled",
+		Type: condIngressReady, Status: metav1.ConditionUnknown, Reason: "IngressReconciled", Message: "Ingress configuration reconciled; check ingress controller readiness",
 	})
 	return false
 }
@@ -356,7 +396,7 @@ func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *pla
 	switch {
 	case err == nil:
 		*conditions = append(*conditions, metav1.Condition{
-			Type: condIngressReady, Status: metav1.ConditionTrue, Reason: "VirtualServiceReconciled",
+			Type: condIngressReady, Status: metav1.ConditionUnknown, Reason: "VirtualServiceReconciled", Message: "VirtualService reconciled; verify gateway programming",
 		})
 	case meta.IsNoMatchError(err):
 		*conditions = append(*conditions, metav1.Condition{
@@ -376,6 +416,22 @@ func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *pla
 
 func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
 	route := buildHTTPRoute(app, r.GatewayName, r.GatewayNamespace)
+	retryDropped := false
+	if r.HTTPRouteRetries {
+		var live gatewayv1.HTTPRoute
+		if err := r.Get(ctx, client.ObjectKeyFromObject(route), &live); err == nil {
+			retryDropped = live.Annotations["celld-operator.io/retry-requested"] == annotationTrue && len(live.Spec.Rules) > 0 && live.Spec.Rules[0].Retry == nil
+		}
+		if route.Annotations == nil {
+			route.Annotations = map[string]string{}
+		}
+		route.Annotations["celld-operator.io/retry-requested"] = annotationTrue
+	}
+	if !r.HTTPRouteRetries || retryDropped {
+		for i := range route.Spec.Rules {
+			route.Spec.Rules[i].Retry = nil
+		}
+	}
 	err := r.ensureObject(ctx, app, route, func(live, desired client.Object) {
 		l, d := live.(*gatewayv1.HTTPRoute), desired.(*gatewayv1.HTTPRoute)
 		l.Spec = d.Spec
@@ -385,16 +441,16 @@ func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platform
 		// Standard-channel Gateway API CRDs silently drop the experimental
 		// retry field; per the fail-loud rule, say so rather than let the
 		// drain-503 retry policy vanish quietly.
-		if dropped, checkErr := r.httpRouteRetryDropped(ctx, route); checkErr == nil && dropped {
+		if dropped, checkErr := r.httpRouteRetryDropped(ctx, route); retryDropped || (checkErr == nil && dropped) {
 			*conditions = append(*conditions, metav1.Condition{
-				Type: condIngressReady, Status: metav1.ConditionTrue,
+				Type: condIngressReady, Status: metav1.ConditionFalse,
 				Reason:  "RouteReconciledRetryDropped",
 				Message: "cluster Gateway API CRDs dropped the retry field (standard channel); drain 503s are not retried at the gateway",
 			})
 			return false
 		}
 		*conditions = append(*conditions, metav1.Condition{
-			Type: condIngressReady, Status: metav1.ConditionTrue, Reason: "RouteReconciled",
+			Type: condIngressReady, Status: r.httpRouteReady(ctx, route), Reason: "RouteObserved",
 		})
 	case meta.IsNoMatchError(err):
 		*conditions = append(*conditions, metav1.Condition{
@@ -559,10 +615,13 @@ func stringMapSubset(sub, of map[string]string) bool {
 func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1alpha1.WorkerApp, outcome fleetOutcome, appVersion string, conditions []metav1.Condition) error {
 	before := app.DeepCopy().Status
 	app.Status.Phase = outcome.Phase
+	app.Status.ExpectedAppVersion = appVersion
+	app.Status.Deployments = nil
 	app.Status.Rollout = platformv1alpha1.RolloutStatus{
 		Partition: outcome.Partition,
 		WaitingOn: outcome.WaitingOn,
 	}
+	app.Status.RolledOutAppVersion = ""
 	if outcome.RolledOut {
 		app.Status.RolledOutAppVersion = appVersion
 	}
@@ -571,14 +630,26 @@ func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1a
 	if err := r.Get(ctx, client.ObjectKey{Namespace: app.Namespace, Name: fleetName(app)}, &sts); err == nil {
 		app.Status.Fleet.Ready = sts.Status.ReadyReplicas
 	}
-	// Fleet restoring is best-effort in status: a partial sweep (fleet mid-
-	// change, pod restarting) reports what answered. The rollout gate does
-	// its own strict sweep.
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app))); err == nil {
-		if _, restoring, err := r.State.FleetSweep(ctx, pods.Items); err == nil {
-			app.Status.Fleet.Restoring = int32(restoring)
+	if states, restoring, err := r.observeFleet(ctx, app, &sts); err == nil {
+		conditions = append(conditions, metav1.Condition{Type: "FleetStateReady", Status: metav1.ConditionTrue, Reason: "Observed"})
+		app.Status.Fleet.Restoring = int32(restoring)
+		for name, state := range states {
+			if d := state.Deployment; d != nil {
+				app.Status.Deployments = append(app.Status.Deployments, platformv1alpha1.PodDeployment{Name: name, Version: d.Version, Generation: d.Generation, Draining: int32(len(d.Draining)), Swapping: d.Swapping})
+			}
 		}
+		slices.SortFunc(app.Status.Deployments, func(a, b platformv1alpha1.PodDeployment) int {
+			if a.Name < b.Name {
+				return -1
+			}
+			if a.Name > b.Name {
+				return 1
+			}
+			return 0
+		})
+	} else {
+		app.Status.Fleet.Restoring = 0
+		conditions = append(conditions, metav1.Condition{Type: "FleetStateReady", Status: metav1.ConditionFalse, Reason: "Unavailable", Message: err.Error()})
 	}
 
 	progressing := outcome.Phase == platformv1alpha1.PhasePending ||
@@ -603,6 +674,15 @@ func (r *WorkerAppReconciler) updateStatus(ctx context.Context, app *platformv1a
 			Message: outcome.WaitingOn,
 		},
 	)
+	types := map[string]bool{}
+	for _, cond := range conditions {
+		types[cond.Type] = true
+	}
+	for _, kind := range []string{condIngressReady, condAutoscalingReady, condDeployTrackingReady} {
+		if !types[kind] {
+			meta.RemoveStatusCondition(&app.Status.Conditions, kind)
+		}
+	}
 	for _, cond := range conditions {
 		cond.ObservedGeneration = app.Generation
 		meta.SetStatusCondition(&app.Status.Conditions, cond)
@@ -643,4 +723,110 @@ func (r *WorkerAppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.Ingress{}).
 		Named("workerapp").
 		Complete(r)
+}
+
+const managedAnnotationsKey = "celld-operator.io/managed-annotations"
+
+func reconcileAnnotations(obj client.Object, desired map[string]string) {
+	annotations := mergeStringMaps(obj.GetAnnotations(), nil)
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	var keys []string
+	_ = json.Unmarshal([]byte(annotations[managedAnnotationsKey]), &keys)
+	// Known legacy Ingress keys can be safely removed without a previous inventory.
+	if _, ok := obj.(*networkingv1.Ingress); ok {
+		keys = append(keys, "nginx.ingress.kubernetes.io/proxy-read-timeout", "nginx.ingress.kubernetes.io/proxy-send-timeout", "cert-manager.io/cluster-issuer")
+	}
+	for _, key := range keys {
+		if _, found := desired[key]; !found {
+			delete(annotations, key)
+		}
+	}
+	keys = nil
+	for key, value := range desired {
+		if key != managedAnnotationsKey {
+			annotations[key] = value
+			keys = append(keys, key)
+		}
+	}
+	slices.Sort(keys)
+	raw, _ := json.Marshal(keys)
+	annotations[managedAnnotationsKey] = string(raw)
+	obj.SetAnnotations(annotations)
+}
+func (r *WorkerAppReconciler) removeObsoleteRoutes(ctx context.Context, app *platformv1alpha1.WorkerApp) error {
+	mode := r.IngressMode
+	if mode == "" {
+		mode = IngressModeHTTPRoute
+	}
+	if len(app.Spec.Hostnames) == 0 {
+		mode = IngressModeNone
+	}
+	for kind, obj := range map[string]client.Object{
+		IngressModeIngress: &networkingv1.Ingress{}, IngressModeHTTPRoute: &gatewayv1.HTTPRoute{},
+		IngressModeVirtualService: newUnstructuredObject("networking.istio.io/v1", "VirtualService", fleetName(app), app.Namespace, nil, nil, nil),
+	} {
+		if kind == mode {
+			continue
+		}
+		err := r.Reader.Get(ctx, client.ObjectKey{Namespace: app.Namespace, Name: fleetName(app)}, obj)
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		// Only delete our own obsolete routes. Foreign names are unrelated.
+		if !metav1.IsControlledBy(obj, app) {
+			continue
+		}
+		uid, rv := obj.GetUID(), obj.GetResourceVersion()
+		if err := r.Delete(ctx, obj, client.Preconditions{UID: &uid, ResourceVersion: &rv}); client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (r *WorkerAppReconciler) httpRouteReady(ctx context.Context, desired *gatewayv1.HTTPRoute) metav1.ConditionStatus {
+	var live gatewayv1.HTTPRoute
+	if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(desired), &live); err != nil {
+		return metav1.ConditionUnknown
+	}
+	for _, parent := range live.Status.Parents {
+		if parent.ParentRef.Name != gatewayv1.ObjectName(r.GatewayName) {
+			continue
+		}
+		namespace := live.Namespace
+		if parent.ParentRef.Namespace != nil {
+			namespace = string(*parent.ParentRef.Namespace)
+		}
+		if namespace != r.GatewayNamespace {
+			continue
+		}
+		accepted, resolved := false, false
+		for _, c := range parent.Conditions {
+			if c.ObservedGeneration != live.Generation {
+				continue
+			}
+			if c.Type == "Accepted" {
+				accepted = c.Status == metav1.ConditionTrue
+			}
+			if c.Type == "ResolvedRefs" {
+				resolved = c.Status == metav1.ConditionTrue
+			}
+		}
+		if accepted && resolved {
+			var gateway gatewayv1.Gateway
+			if err := r.Reader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: string(parent.ParentRef.Name)}, &gateway); err != nil {
+				return metav1.ConditionUnknown
+			}
+			for _, cond := range gateway.Status.Conditions {
+				if cond.Type == "Programmed" && cond.ObservedGeneration == gateway.Generation && cond.Status == metav1.ConditionTrue {
+					return metav1.ConditionTrue
+				}
+			}
+		}
+	}
+	return metav1.ConditionFalse
 }
