@@ -1,6 +1,6 @@
 module github.com/ezgamehost/celld-operator
 
-go 1.26.0
+go 1.26.8
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.43.5
