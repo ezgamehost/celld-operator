@@ -42,6 +42,7 @@ old fleet, provision a new WorkerApp with the intended storage, and only then
 resume traffic. Never overlap fleets sharing a bucket prefix. Do not delete
 local state as a substitute for verifying bucket recovery.
 
+KEDA v2.12.0 or newer is required for the Paused=True acknowledgement.
 The operator pauses KEDA and waits for its acknowledgement and HPA removal before
 rolling changes. A stalled pause blocks rollout. Unmanaged HPAs targeting the
 same StatefulSet also block it. Recreate waits for all old pods, including
@@ -125,8 +126,8 @@ or changing ingress modes removes obsolete owned routes.
 HTTPRoute retries default off for standard Gateway API CRDs. Enable
 `operator.httpRouteRetries` only with experimental CRDs and a supporting gateway.
 If the API prunes retries, the controller reports failure and stops rewriting
-them. After upgrading the CRDs, remove the route's
-`celld-operator.io/retry-requested` annotation to retry configuration. Clients
+them. Support is retried automatically after a persisted five-minute delay, so upgrading
+the CRDs does not require manually clearing the retry latch. Clients
 must tolerate rollout 503s unless their ingress is configured to retry them;
 WebSocket connections may still close during node replacement.
 

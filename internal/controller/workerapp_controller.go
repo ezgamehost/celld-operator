@@ -160,6 +160,9 @@ func (r *WorkerAppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err := r.validateApp(app); err != nil {
 		condition := metav1.Condition{Type: "SpecValid", Status: metav1.ConditionFalse, Reason: "InvalidConfiguration", Message: err.Error(), ObservedGeneration: app.Generation}
 		before := app.DeepCopy()
+		for _, kind := range []string{condIngressReady, condAutoscalingReady, condDeployTrackingReady} {
+			meta.RemoveStatusCondition(&app.Status.Conditions, kind)
+		}
 		meta.SetStatusCondition(&app.Status.Conditions, condition)
 		app.Status.Phase = platformv1alpha1.PhaseDegraded
 		app.Status.RolledOutAppVersion = ""
@@ -416,22 +419,7 @@ func (r *WorkerAppReconciler) ensureVirtualService(ctx context.Context, app *pla
 
 func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platformv1alpha1.WorkerApp, conditions *[]metav1.Condition) bool {
 	route := buildHTTPRoute(app, r.GatewayName, r.GatewayNamespace)
-	retryDropped := false
-	if r.HTTPRouteRetries {
-		var live gatewayv1.HTTPRoute
-		if err := r.Get(ctx, client.ObjectKeyFromObject(route), &live); err == nil {
-			retryDropped = live.Annotations["celld-operator.io/retry-requested"] == annotationTrue && len(live.Spec.Rules) > 0 && live.Spec.Rules[0].Retry == nil
-		}
-		if route.Annotations == nil {
-			route.Annotations = map[string]string{}
-		}
-		route.Annotations["celld-operator.io/retry-requested"] = annotationTrue
-	}
-	if !r.HTTPRouteRetries || retryDropped {
-		for i := range route.Spec.Rules {
-			route.Spec.Rules[i].Retry = nil
-		}
-	}
+	retryDropped := r.configureHTTPRouteRetries(ctx, route)
 	err := r.ensureObject(ctx, app, route, func(live, desired client.Object) {
 		l, d := live.(*gatewayv1.HTTPRoute), desired.(*gatewayv1.HTTPRoute)
 		l.Spec = d.Spec
@@ -447,7 +435,7 @@ func (r *WorkerAppReconciler) ensureHTTPRoute(ctx context.Context, app *platform
 				Reason:  "RouteReconciledRetryDropped",
 				Message: "cluster Gateway API CRDs dropped the retry field (standard channel); drain 503s are not retried at the gateway",
 			})
-			return false
+			return true // Use the bounded transient requeue while waiting to retry support
 		}
 		*conditions = append(*conditions, metav1.Condition{
 			Type: condIngressReady, Status: r.httpRouteReady(ctx, route), Reason: "RouteObserved",
@@ -829,4 +817,40 @@ func (r *WorkerAppReconciler) httpRouteReady(ctx context.Context, desired *gatew
 		}
 	}
 	return metav1.ConditionFalse
+}
+
+const retryRequestedAnnotation = "celld-operator.io/retry-requested"
+const retryRecheckAnnotation = "celld-operator.io/retry-recheck-after"
+
+// Preserve pruned retries until the persisted deadline, then clear the latch.
+// The next reconcile probes support again; watch events cannot bypass the delay.
+func (r *WorkerAppReconciler) configureHTTPRouteRetries(ctx context.Context, route *gatewayv1.HTTPRoute) bool {
+	dropped := false
+	if r.HTTPRouteRetries {
+		if route.Annotations == nil {
+			route.Annotations = map[string]string{}
+		}
+		route.Annotations[retryRequestedAnnotation] = annotationTrue
+		var live gatewayv1.HTTPRoute
+		if err := r.Get(ctx, client.ObjectKeyFromObject(route), &live); err == nil {
+			dropped = live.Annotations[retryRequestedAnnotation] == annotationTrue && len(live.Spec.Rules) > 0 && live.Spec.Rules[0].Retry == nil
+			if dropped {
+				deadline, err := time.Parse(time.RFC3339Nano, live.Annotations[retryRecheckAnnotation])
+				if err != nil {
+					deadline = time.Now().Add(5 * time.Minute)
+				}
+				if time.Now().Before(deadline) {
+					route.Annotations[retryRecheckAnnotation] = deadline.UTC().Format(time.RFC3339Nano)
+				} else {
+					delete(route.Annotations, retryRequestedAnnotation)
+				}
+			}
+		}
+	}
+	if !r.HTTPRouteRetries || dropped {
+		for i := range route.Spec.Rules {
+			route.Spec.Rules[i].Retry = nil
+		}
+	}
+	return dropped
 }

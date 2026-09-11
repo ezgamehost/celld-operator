@@ -276,11 +276,15 @@ HELM_CHART_DIR ?= dist/chart
 HELM_EXTRA_ARGS ?=
 
 .PHONY: install-helm
-install-helm: ## Install Helm v3.19.0 if absent.
-	@command -v $(HELM) >/dev/null 2>&1 || { \
-		echo "Installing Helm..." && \
-		curl -fsSL https://raw.githubusercontent.com/helm/helm/v3.19.0/scripts/get-helm-3 | DESIRED_VERSION=v3.19.0 bash; \
-	}
+install-helm: ## Require Helm v3.19.0, installing the pinned release if needed.
+	@set -e; \
+	if [ "$$($(HELM) version --template '{{.Version}}' 2>/dev/null || true)" != "v3.19.0" ]; then \
+		task_installer=$$(mktemp); trap 'rm -f "$$task_installer"' EXIT; \
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/v3.19.0/scripts/get-helm-3 -o "$$task_installer"; \
+		printf '%s  %s\n' '4a01413bf2a767ae744b8bbe4485cd83654d9a0a769c92377afc36328d5a007a' "$$task_installer" | sha256sum -c -; \
+		DESIRED_VERSION=v3.19.0 bash "$$task_installer"; \
+	fi; \
+	test "$$($(HELM) version --template '{{.Version}}')" = "v3.19.0"
 
 .PHONY: helm-deploy
 helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.

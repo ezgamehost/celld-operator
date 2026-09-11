@@ -534,6 +534,7 @@ func (r *WorkerAppReconciler) observeFleet(ctx context.Context, app *platformv1a
 	return r.State.FleetSweep(ctx, pods.Items)
 }
 
+// KEDA v2.12.0 or newer is required for the Paused=True acknowledgement.
 // KEDA acknowledges a full pause only after stopping its scale loop and
 // deleting its HPA. Independently check that no HPA still targets this fleet.
 func (r *WorkerAppReconciler) pauseScaling(ctx context.Context, app *platformv1alpha1.WorkerApp) (bool, error) {
@@ -550,7 +551,7 @@ func (r *WorkerAppReconciler) pauseScaling(ctx context.Context, app *platformv1a
 		if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 			return false, err
 		}
-	} else {
+	} else if !meta.IsNoMatchError(err) {
 		if err != nil && !apierrors.IsNotFound(err) {
 			return false, err
 		}

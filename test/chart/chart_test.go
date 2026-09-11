@@ -2,6 +2,7 @@ package chart
 
 import (
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
@@ -89,7 +90,7 @@ func assertManager(t *testing.T, object unstructured.Unstructured, mode string) 
 	if mode == certificateMode && !strings.Contains(joined, "--metrics-cert-path=") {
 		t.Fatal("certificate not passed to manager")
 	}
-	if mode == disabledMode && !strings.Contains(joined, "--metrics-bind-address=0") {
+	if mode == disabledMode && !slices.Contains(flags, "--metrics-bind-address=0") {
 		t.Fatal("metrics still enabled")
 	}
 }

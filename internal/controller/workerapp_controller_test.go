@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -121,6 +123,24 @@ var _ = Describe("WorkerApp Controller", func() {
 			internal := &corev1.Service{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceNamespace, Name: resourceName + "-celld-internal"}, internal); err == nil {
 				Expect(k8sClient.Delete(ctx, internal)).To(Succeed())
+			}
+		})
+
+		It("should validate DNS subdomain label and total length boundaries", func() {
+			valid := []string{"cluster.local", "a", strings.Repeat("a", 63) + ".local", strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 61)}
+			invalid := []string{"", "a..b", "a.-b", "a-.b", "a.", ".a", strings.Repeat("a", 64) + ".local", strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 62)}
+			for _, domain := range valid {
+				app := &platformv1alpha1.WorkerApp{}
+				Expect(k8sClient.Get(ctx, typeNamespacedName, app)).To(Succeed())
+				app.Spec.ClusterDomain = domain
+				Expect(k8sClient.Update(ctx, app)).To(Succeed(), domain)
+			}
+			for _, domain := range invalid {
+				// A raw patch retains empty strings rather than omitting the field.
+				app := &platformv1alpha1.WorkerApp{}
+				Expect(k8sClient.Get(ctx, typeNamespacedName, app)).To(Succeed())
+				patch := client.RawPatch(types.MergePatchType, fmt.Appendf(nil, `{"spec":{"clusterDomain":%q}}`, domain))
+				Expect(errors.IsInvalid(k8sClient.Patch(ctx, app, patch))).To(BeTrue(), domain)
 			}
 		})
 

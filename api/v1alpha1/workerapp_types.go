@@ -337,7 +337,8 @@ type WorkerAppSpec struct {
 	// clusterDomain is the Kubernetes DNS suffix.
 	// +optional
 	// +kubebuilder:default="cluster.local"
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`
 	ClusterDomain string `json:"clusterDomain,omitempty"`
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`

@@ -68,7 +68,7 @@ credentials — tenancy lives at the Kubernetes layer. WorkerApp authors are tru
   - **Istio** for internal-listener AuthorizationPolicies (ambient mode
     recommended: it encrypts the peer network without putting a sidecar in
     celld's drain path).
-  - **KEDA** + **Prometheus** (scraping the operator) for autoscaling.
+  - **KEDA v2.12.0+** + **Prometheus** (scraping the operator) for autoscaling.
 
 ## Install
 

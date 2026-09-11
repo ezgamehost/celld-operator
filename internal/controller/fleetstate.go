@@ -189,7 +189,7 @@ func (c *StateClient) FleetSweep(ctx context.Context, pods []corev1.Pod) (map[st
 	states := make(map[string]*PodState, len(pods))
 	var restoring int64
 	var mu sync.Mutex
-	group, groupCtx := errgroup.WithContext(ctx)
+	var group errgroup.Group
 	group.SetLimit(16)
 	for i := range pods {
 		pod := pods[i]
@@ -197,7 +197,7 @@ func (c *StateClient) FleetSweep(ctx context.Context, pods []corev1.Pod) (map[st
 			if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning || !pod.DeletionTimestamp.IsZero() {
 				return fmt.Errorf("pod %s is unavailable", pod.Name)
 			}
-			state, err := c.Fetch(groupCtx, pod.Status.PodIP)
+			state, err := c.Fetch(ctx, pod.Status.PodIP)
 			if err != nil {
 				return fmt.Errorf("pod %s: %w", pod.Name, err)
 			}

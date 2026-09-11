@@ -18,10 +18,12 @@ import (
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -324,6 +326,9 @@ func TestScaleQueriesRequireFreshCompleteData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(triggers) == 0 {
+		t.Fatal("missing scaling triggers")
+	}
 	for _, item := range triggers {
 		metadata := item.(map[string]any)["metadata"].(map[string]any)
 		query := metadata["query"].(string)
@@ -378,13 +383,13 @@ func TestPrunedHTTPRouteRetryDoesNotRewrite(t *testing.T) {
 	for i := range route.Spec.Rules {
 		route.Spec.Rules[i].Retry = nil
 	}
-	reconcileAnnotations(route, map[string]string{"celld-operator.io/retry-requested": annotationTrue})
+	reconcileAnnotations(route, map[string]string{retryRequestedAnnotation: annotationTrue, retryRecheckAnnotation: time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)})
 	if err := r.Create(context.Background(), route); err != nil {
 		t.Fatal(err)
 	}
 	var conditions []metav1.Condition
-	if retry := r.ensureHTTPRoute(context.Background(), app, &conditions); retry {
-		t.Fatal("unexpected route error")
+	if retry := r.ensureHTTPRoute(context.Background(), app, &conditions); !retry {
+		t.Fatal("missing bounded support recheck")
 	}
 	var live gatewayv1.HTTPRoute
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(route), &live); err != nil {
@@ -395,5 +400,102 @@ func TestPrunedHTTPRouteRetryDoesNotRewrite(t *testing.T) {
 	}
 	if len(conditions) != 1 || conditions[0].Status != metav1.ConditionFalse {
 		t.Fatal("missing unsupported retry condition")
+	}
+}
+
+func TestFleetSweepRetainsHealthySamplesAfterPodFailure(t *testing.T) {
+	// Fill the concurrency limit with unavailable pods before scheduling a healthy
+	// one, making errgroup cancellation deterministic in the regression case.
+	pods := make([]corev1.Pod, 17)
+	for i := range pods {
+		pods[i].Name = fmt.Sprintf("pod-%d", i)
+	}
+	pods[16].Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"}
+	state := &StateClient{HTTP: &http.Client{Transport: stateRoundTripper(func(req *http.Request) (*http.Response, error) {
+		if err := req.Context().Err(); err != nil {
+			return nil, err
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(healthyState)), Header: make(http.Header)}, nil
+	})}}
+	states, _, err := state.FleetSweep(context.Background(), pods)
+	if err == nil || len(states) != 1 || states["pod-16"] == nil {
+		t.Fatalf("lost healthy sample: states=%v error=%v", states, err)
+	}
+}
+
+type noKEDAReader struct{ client.Reader }
+
+func (r noKEDAReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if obj.GetObjectKind().GroupVersionKind().Group == "keda.sh" {
+		return &meta.NoKindMatchError{GroupKind: obj.GetObjectKind().GroupVersionKind().GroupKind()}
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+func TestMissingKEDAStillChecksResidualHPA(t *testing.T) {
+	r, app, sts := productionFixture(t)
+	app.Spec.Autoscaling = &platformv1alpha1.AutoscalingSpec{Enabled: true}
+	r.Reader = noKEDAReader{r.Reader}
+	paused, err := r.pauseScaling(context.Background(), app)
+	if err != nil || !paused {
+		t.Fatalf("missing KEDA blocks fleet: paused=%v err=%v", paused, err)
+	}
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{ObjectMeta: metav1.ObjectMeta{Name: "residual", Namespace: app.Namespace}, Spec: autoscalingv2.HorizontalPodAutoscalerSpec{ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{Kind: testStatefulSetKind, Name: sts.Name}}}
+	if err := r.Create(context.Background(), hpa); err != nil {
+		t.Fatal(err)
+	}
+	paused, err = r.pauseScaling(context.Background(), app)
+	if err != nil || paused {
+		t.Fatalf("residual HPA ignored: paused=%v err=%v", paused, err)
+	}
+}
+func TestInvalidSpecRetiresIntegrationConditions(t *testing.T) {
+	r, app, _ := productionFixture(t)
+	app.Spec.Celld.Image = "untrusted:v0.4.0"
+	if err := r.Update(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{condIngressReady, condAutoscalingReady, condDeployTrackingReady} {
+		app.Status.Conditions = append(app.Status.Conditions, metav1.Condition{Type: kind, Status: metav1.ConditionTrue, Reason: "Old"})
+	}
+	if err := r.Status().Update(context.Background(), app); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(app)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Get(context.Background(), client.ObjectKeyFromObject(app), app); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{condIngressReady, condAutoscalingReady, condDeployTrackingReady} {
+		if meta.FindStatusCondition(app.Status.Conditions, kind) != nil {
+			t.Fatalf("stale %s", kind)
+		}
+	}
+	if app.Status.Phase != platformv1alpha1.PhaseDegraded || !meta.IsStatusConditionFalse(app.Status.Conditions, "SpecValid") {
+		t.Fatal("invalid status lost")
+	}
+}
+func TestHTTPRouteRetryLatchExpires(t *testing.T) {
+	r, app, _ := productionFixture(t)
+	r.HTTPRouteRetries = true
+	route := buildHTTPRoute(app, "edge", "infra")
+	for i := range route.Spec.Rules {
+		route.Spec.Rules[i].Retry = nil
+	}
+	reconcileAnnotations(route, map[string]string{retryRequestedAnnotation: annotationTrue, retryRecheckAnnotation: time.Now().Add(-time.Minute).Format(time.RFC3339Nano)})
+	if err := r.Create(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	desired := buildHTTPRoute(app, "edge", "infra")
+	if !r.configureHTTPRouteRetries(context.Background(), desired) || desired.Annotations[retryRequestedAnnotation] != "" || desired.Spec.Rules[0].Retry != nil {
+		t.Fatal("expired latch not cleared while retaining pruned spec")
+	}
+	reconcileAnnotations(route, desired.Annotations)
+	if err := r.Update(context.Background(), route); err != nil {
+		t.Fatal(err)
+	}
+	desired = buildHTTPRoute(app, "edge", "infra")
+	if r.configureHTTPRouteRetries(context.Background(), desired) || desired.Spec.Rules[0].Retry == nil {
+		t.Fatal("support not retried after latch expiry")
 	}
 }
