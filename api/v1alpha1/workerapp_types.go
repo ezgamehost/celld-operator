@@ -29,7 +29,7 @@ import (
 // UpdateStrategy selects how a celld version change rolls through the fleet.
 // Rolling is the partition-stepped, restoring-gated path (docs/celld-behaviors.md);
 // Recreate scales to zero first, for upstream releases that forbid mixed
-// fleets or flag a downgrade as lossy. A Rolling request across a
+// fleets. Downgrades from v0.3+ to older runtimes remain blocked. A Rolling request across a
 // known-breaking celld boundary is refused (F8).
 // +kubebuilder:validation:Enum=Rolling;Recreate
 type UpdateStrategy string
@@ -41,9 +41,10 @@ const (
 
 // CelldSpec pins the celld runtime for the fleet.
 type CelldSpec struct {
-	// image is the celld container image, tag included. Mixed-version fleets
-	// are never created; changing this triggers the strategy below.
+	// image is an explicitly versioned celld image. Known incompatible versions
+	// require Recreate; compatible releases roll one pod at a time.
 	// +required
+	// +kubebuilder:validation:MinLength=1
 	Image string `json:"image"`
 
 	// updateStrategy selects the rollout path for celld version changes.
@@ -55,6 +56,7 @@ type CelldSpec struct {
 // BucketCredentials selects how the fleet authenticates to its bucket
 // prefix. Exactly one mechanism applies; iamRole is preferred because the
 // bucket credential is fleet-admin authority and static keys spread.
+// +kubebuilder:validation:XValidation:rule="[has(self.iamRole) && self.iamRole.size() > 0, has(self.secretRef) && self.secretRef.size() > 0, has(self.azureClientID) && self.azureClientID.size() > 0].filter(x, x).size() <= 1",message="select at most one credential family"
 type BucketCredentials struct {
 	// iamRole is an IAM role ARN assumed via the pod's service account
 	// (IRSA / Workload Identity), or the literal "auto" to have the
@@ -67,6 +69,7 @@ type BucketCredentials struct {
 	// AZURE_STORAGE_ACCOUNT_KEY for an az:// container. For stores where
 	// identity-based auth is unavailable.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	SecretRef string `json:"secretRef,omitempty"`
 
 	// azureClientID is the client ID of a Microsoft Entra workload identity
@@ -83,6 +86,9 @@ type BucketCredentials struct {
 // BucketSpec locates the fleet's slice of the object store.
 // +kubebuilder:validation:XValidation:rule="!self.name.startsWith('az://') || (has(self.storageAccount) && self.storageAccount.size() > 0)",message="an az:// bucket requires storageAccount (the Azure storage account; the bucket name is the container)"
 // +kubebuilder:validation:XValidation:rule="!has(self.endpoint) || self.endpoint.size() == 0 || self.name.startsWith('s3://')",message="endpoint applies to s3:// buckets only; celld rejects an endpoint for gs:// and az://"
+// +kubebuilder:validation:XValidation:rule="self.name == oldSelf.name",message="bucket identity is immutable; migrate to a new WorkerApp"
+// +kubebuilder:validation:XValidation:rule="has(self.storageAccount) == has(oldSelf.storageAccount) && (!has(self.storageAccount) || self.storageAccount == oldSelf.storageAccount)",message="storage account is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.endpoint) == has(oldSelf.endpoint) && (!has(self.endpoint) || self.endpoint == oldSelf.endpoint)",message="bucket endpoint is immutable"
 type BucketSpec struct {
 	// name is the fleet bucket and prefix, e.g. "s3://platform-cells/apps/chat",
 	// "gs://platform-cells/apps/chat", or "az://platform-cells/apps/chat"
@@ -91,7 +97,7 @@ type BucketSpec struct {
 	// contract (conditional create/overwrite, read-after-write); see
 	// docs/celld-behaviors.md for the qualified list.
 	// +required
-	// +kubebuilder:validation:Pattern=`^(s3|gs|az)://.+`
+	// +kubebuilder:validation:Pattern=`^(s3|gs|az)://[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9._/-]+)?$`
 	// +kubebuilder:validation:MaxLength=1024
 	Name string `json:"name"`
 
@@ -126,10 +132,22 @@ type BucketSpec struct {
 // applies that threshold to the memory its cells hold and keeps its own
 // absolute cap at 95% of the limit on the process RSS (docs/celld-behaviors.md F10).
 type ResourcesSpec struct {
+	// cpuMillis is the CPU request per pod.
+	// +optional
+	// +kubebuilder:default=500
+	// +kubebuilder:validation:Minimum=1
+	CPUMillis int32 `json:"cpuMillis,omitempty"`
+	// ephemeralStorageGi bounds writable temporary storage.
+	// +optional
+	// +kubebuilder:default=10
+	// +kubebuilder:validation:Minimum=1
+	EphemeralStorageGi int32 `json:"ephemeralStorageGi,omitempty"`
+
 	// memoryGi is the container memory limit per pod, in GiB.
 	// +optional
 	// +kubebuilder:default=8
 	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65536
 	MemoryGi int32 `json:"memoryGi,omitempty"`
 
 	// maxResidentCells is the hard per-node resident-cell admission limit
@@ -146,6 +164,7 @@ type VarsSpec struct {
 	// CELLD_VARS_FILE. Rotation is a Secret update plus an ordinary gated
 	// rollout; values are never baked into bundles.
 	// +required
+	// +kubebuilder:validation:MinLength=1
 	SecretRef string `json:"secretRef"`
 }
 
@@ -193,8 +212,10 @@ type AutoscalingTargets struct {
 // operator materializes it as a KEDA ScaledObject over its own
 // /state-derived Prometheus metrics, and pauses it during rollouts so the
 // scaler and the partition controller never fight over replica count.
+// +kubebuilder:validation:XValidation:rule="self.minReplicas <= self.maxReplicas",message="minReplicas must not exceed maxReplicas"
 type AutoscalingSpec struct {
 	// +optional
+	// +kubebuilder:default=false
 	Enabled bool `json:"enabled,omitempty"`
 
 	// minReplicas is the scale floor; keep >= 2 for HA.
@@ -276,8 +297,54 @@ const (
 	DurabilityBucket Durability = "bucket"
 )
 
+// StorageSpec provisions retained local state per ordinal. Changing storage
+// configuration requires a new WorkerApp; existing PVCs are never deleted.
+type StorageSpec struct {
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65536
+	SizeGi int32 `json:"sizeGi"`
+	// +optional
+	StorageClassName *string `json:"storageClassName,omitempty"`
+}
+
+// SchedulingSpec controls placement. Persistent fleets always require distinct
+// hosts; spreadAcrossZones additionally requires distinct zones.
+type SchedulingSpec struct {
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+	// +optional
+	SpreadAcrossZones bool `json:"spreadAcrossZones,omitempty"`
+}
+
 // WorkerAppSpec defines the desired state of WorkerApp.
+// +kubebuilder:validation:XValidation:rule="self.appVersion != 'auto' || (self.bucket.name.startsWith('s3://') && has(self.deployTrackingSecretRef))",message="auto requires an s3 bucket and a deployTrackingSecretRef"
+// +kubebuilder:validation:XValidation:rule="!has(self.durability) || self.durability != 'fleet' || (has(self.storage) && self.replicas >= 3 && (!has(self.autoscaling) || !self.autoscaling.enabled || self.autoscaling.minReplicas >= 3))",message="fleet durability requires persistent storage and at least three replicas"
+// +kubebuilder:validation:XValidation:rule="has(self.storage) == has(oldSelf.storage) && (!has(self.storage) || self.storage == oldSelf.storage)",message="storage is immutable; migrate to a new WorkerApp"
+
 type WorkerAppSpec struct {
+	// deployTrackingSecretRef is a dedicated read-only S3 credential for
+	// deploy/current.json. The operator never uses its ambient cloud identity.
+	// +optional
+	// +kubebuilder:validation:MinLength=1
+	DeployTrackingSecretRef string `json:"deployTrackingSecretRef,omitempty"`
+	// deploymentPolicy selects adoption in place or an additional gated restart.
+	// +optional
+	// +kubebuilder:default=Restart
+	// +kubebuilder:validation:Enum=Restart;InPlace
+	DeploymentPolicy string `json:"deploymentPolicy,omitempty"`
+	// clusterDomain is the Kubernetes DNS suffix.
+	// +optional
+	// +kubebuilder:default="cluster.local"
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`
+	ClusterDomain string `json:"clusterDomain,omitempty"`
+	// +optional
+	Storage *StorageSpec `json:"storage,omitempty"`
+	// +optional
+	Scheduling SchedulingSpec `json:"scheduling,omitzero"`
+
 	// hostnames route to this app. One route object is reconciled in the
 	// app's namespace carrying every hostname; what kind depends on the
 	// operator's --ingress-mode.
@@ -285,12 +352,9 @@ type WorkerAppSpec struct {
 	// +listType=set
 	Hostnames []string `json:"hostnames,omitempty"`
 
-	// appVersion names the application deployment in the fleet bucket
-	// (written there by `celld deploy`). Nodes load a deployment at startup
-	// only, so changing this triggers the gated rollout (docs/celld-behaviors.md).
-	// The sentinel "auto" makes the operator follow the bucket's
-	// deploy/current.json instead: `celld deploy` alone rolls the fleet,
-	// within one poll interval, with no CR edit.
+	// appVersion is the expected deployment, not a runtime pin: celld v0.4
+	// adopts the bucket pointer in place. auto reads the pointer using the
+	// dedicated tracking credential. Status verifies live node versions.
 	// +required
 	// +kubebuilder:validation:MinLength=1
 	AppVersion string `json:"appVersion"`
@@ -335,9 +399,10 @@ type WorkerAppSpec struct {
 	// durability selects how celld proves a write before acknowledging it:
 	// fleet (celld's default: two follower nodes fsync it, the bucket
 	// upload follows) or bucket (the write is in the bucket first). Unset
-	// leaves celld's default. Changing it restarts the fleet through the
+	// selects bucket acknowledgement for safety with ephemeral storage. Changing it restarts the fleet through the
 	// ordinary gated rollout.
 	// +optional
+	// +kubebuilder:default=bucket
 	Durability Durability `json:"durability,omitempty"`
 
 	// trustForwardedHeaders lets X-Forwarded-Host and X-Forwarded-Proto
@@ -390,8 +455,26 @@ type FleetStatus struct {
 	Restoring int32 `json:"restoring"`
 }
 
+// PodDeployment reports a live node's adoption state.
+type PodDeployment struct {
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	Generation int64  `json:"generation"`
+	Draining   int32  `json:"draining"`
+	Swapping   int64  `json:"swapping"`
+}
+
 // WorkerAppStatus defines the observed state of WorkerApp.
 type WorkerAppStatus struct {
+	// expectedAppVersion is the resolved deployment target.
+	// +optional
+	ExpectedAppVersion string `json:"expectedAppVersion,omitempty"`
+	// deployments are fresh observations; missing nodes are not inferred.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	Deployments []PodDeployment `json:"deployments,omitempty"`
+
 	// +optional
 	Phase WorkerAppPhase `json:"phase,omitempty"`
 
@@ -414,6 +497,7 @@ type WorkerAppStatus struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 48",message="WorkerApp name must not exceed 48 characters"
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="App",type=string,JSONPath=`.status.rolledOutAppVersion`

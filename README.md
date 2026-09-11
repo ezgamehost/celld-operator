@@ -43,11 +43,10 @@ flowchart LR
   P0 & P1 & P2 --> B[("bucket\ns3://cells/apps/tenant")]
 ```
 
+See [production operation and upgrade requirements](docs/production.md) before deploying or upgrading.
+
 Each application is its own fleet with its own bucket prefix and its own
-credentials — tenancy lives at the Kubernetes layer. Even a full runtime
-compromise inside one fleet reaches only that app's pods and that app's
-prefix. This is a platform for *your* applications (or your customers' apps
-under your operation), not for anonymous hostile code.
+credentials — tenancy lives at the Kubernetes layer. WorkerApp authors are trusted workload deployers who can reference namespace Secrets. Isolate tenants with namespace RBAC and scoped bucket credentials; verify network policy and encrypted peer transport on your platform.
 
 ## Prerequisites
 
@@ -69,7 +68,7 @@ under your operation), not for anonymous hostile code.
   - **Istio** for internal-listener AuthorizationPolicies (ambient mode
     recommended: it encrypts the peer network without putting a sidecar in
     celld's drain path).
-  - **KEDA** + **Prometheus** (scraping the operator) for autoscaling.
+  - **KEDA v2.12.0+** + **Prometheus** (scraping the operator) for autoscaling.
 
 ## Install
 
@@ -114,7 +113,7 @@ celld deploy . --bucket s3://platform-cells/apps/chat \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com --region auto
 ```
 
-**2. Create the WorkerApp:**
+**2. Configure the operator endpoint/identity allowlists** for the values below (see [production configuration](docs/production.md)), then create the WorkerApp:
 
 ```yaml
 apiVersion: celld-operator.io/v1alpha1
@@ -149,7 +148,7 @@ spec:
   #   type: ClusterIP                    # hostnames at all — consumers use <app>-celld.<ns>.svc:8080
   #   annotations: {}                    # or LoadBalancer + annotations for a private LB
   websockets: true                       # long idle timeouts, sticky-friendly, slow scale-down
-  # durability: fleet                    # celld's default since 0.3; "bucket" waits for the upload before acking
+  durability: bucket                    # operator default; fleet requires PVCs and >=3 replicas
   # trustForwardedHeaders: true          # request.url from X-Forwarded-*; only behind a proxy that replaces both
   autoscaling:
     enabled: true
@@ -192,16 +191,14 @@ retains a conservative gated restart when this field changes. v0.4 does not
 need that restart to adopt code, but it gives the CR an explicit convergence
 point and keeps `status.rolledOutAppVersion` tied to the declared deployment.
 
-Prefer `celld deploy` to be the whole story? Set `appVersion: auto`. The
-operator follows the bucket's `deploy/current.json`; a new publish updates the
-expected version within one `--deploy-poll-interval` (default 60s), while celld
-itself normally adopts within 30s. In pinned mode the same read powers a
-`DeployTrackingReady: VersionMismatch` warning when the bucket pointer and the
-CR disagree — but only for fleets using `secretRef` credentials; the operator
-does not read the bucket for `iamRole` fleets. Tracking reads use the fleet's
-`secretRef` credentials, or the operator's ambient AWS identity otherwise,
-and support `s3://` buckets only: a `gs://` or `az://` fleet must pin
-`appVersion` (`DeployTrackingReady: UnsupportedStore` says so).
+Use `deploymentPolicy: InPlace` to adopt without restarting on expected-version
+changes. `status.deployments` reports live versions/generations; rollout completion
+requires all pods to serve the expectation with no draining or swapping.
+
+For automatic tracking, set `appVersion: auto` and `deployTrackingSecretRef` to
+a dedicated read-only S3 Secret. No ambient manager credentials are used.
+Pinned mode can supply the same Secret for drift warnings. GCS and Azure auto
+tracking are rejected. See the [credential contract](docs/production.md).
 
 A deployment can also need a newer celld than the fleet runs: the manifest
 names the features it uses. v0.4 adds Workers KV, Queues, Workflows, and R2
@@ -237,14 +234,12 @@ SIGKILL.
 | --- | --- | --- |
 | v0.1 ↔ v0.2 | No, either direction | Mixed fleets break: ownership records changed address semantics and block objects changed format |
 | v0.2.1 → v0.3.0 | **Yes** | A v0.3 node that cannot replicate to a v0.2 peer falls back to bucket proofs until the peer upgrades |
-| v0.3 → v0.2 | No | A v0.2 binary cannot read writes still waiting in v0.3's replicated log or bundle objects, so the downgrade can lose acknowledged writes. `Recreate` drains every node first, which seals each log (`node-log close: sealed epoch` in the shutdown log); check for that line before trusting the downgrade |
+| v0.3 → v0.2 | Blocked, including Recreate | A v0.2 binary cannot read writes still waiting in v0.3 replicated logs or bundle objects; pod disappearance does not prove sealing |
 | v0.3 ↔ v0.4 | No, either direction | v0.4's versioned peer tunnel refuses v0.3 peers, and v0.3 cannot read v0.4's epoch-qualified large Workers KV value references. Use `Recreate`: stop every v0.3 node before starting v0.4 |
 
-celld 0.3 also changed the default write-acknowledgement proof from `bucket`
-to `fleet` (two follower nodes hold the write on disk, the bucket upload
-trails): a rolling upgrade switches each node as it restarts, and
-`spec.durability: bucket` pins the old behavior if you want write latency
-and durability to keep depending on the bucket alone.
+The operator defaults to `durability: bucket` independently of celld's default.
+Fleet acknowledgement requires retained PVCs, at least three replicas and
+required host separation; optional required zone separation is available.
 
 ## Autoscaling
 
@@ -261,6 +256,7 @@ celld has no metrics endpoint yet, so the operator polls each pod's internal
 | `celld_rss_bytes` / `celld_in_use_bytes` | Process RSS and RSS minus allocator retention |
 | `celld_cgroup_working_set_bytes` / `celld_cgroup_current_bytes` | v0.4 active cgroup memory used by pressure shedding, and the complete cgroup charge used by the absolute cap; absent outside a readable Linux cgroup |
 | `celld_container_restarts` / `celld_self_fenced` | Kubelet restart count, and 1 if the last exit was a celld self-fence (exit code 3) — a fence loop means the store or the bucket credential is broken |
+| `celld_fleet_complete` / `celld_fleet_sample_timestamp_seconds` | Complete-census safety gate and sample time; scaling requires a complete sample younger than 60s |
 | `celld_state_up` | 1 if `/state` answered the last poll |
 
 With `spec.autoscaling.enabled`, the operator materializes a KEDA
@@ -278,19 +274,14 @@ them wrong via templates because there are no templates:
 
 - **Liveness is TCP-only.** celld's health path answers 503 during a graceful
   drain; an HTTP liveness probe there would kill nodes mid-handoff.
-- **Termination grace (40s) exceeds the drain bound** (`CELLD_SHUTDOWN_DRAIN_MS`,
-  25s), so the kubelet never SIGKILLs a draining node, and the node-log seal
-  that follows the drain gets its headroom.
+- **Termination grace is 60s**, exceeding the configured 40s total shutdown bound. Forced termination or infrastructure failure can still interrupt sealing.
 - **`CELLD_MAX_RSS_MB` is set explicitly** to ~80% of the container memory
   limit, so the ceiling is visible in the pod spec rather than inferred (celld
   derives the same 80% from the cgroup limit on its own). celld applies it to
   the memory the cells hold and keeps its own absolute cap at 95% of the limit
   on the process RSS; 80% stays under that cap, so shedding can still recover
   the node.
-- **Fleet pods spread across hosts** (soft hostname topology spread). With
-  celld 0.3's fleet durability an acknowledged write lives on two follower
-  disks until the bucket upload lands; co-located followers would make one
-  host failure lose it.
+- **Persistent fleet pods require different hosts**, with optional required zone separation. Fleet durability requires persistent storage and at least three replicas.
 - **Self-fenced nodes come back.** celld exits with code 3 after a
   `SELF-FENCE:` and requires a supervisor that restarts it without limit,
   spacing attempts by at least one lease lifetime (10s); the kubelet's
@@ -298,13 +289,11 @@ them wrong via templates because there are no templates:
   `celld_self_fenced` makes a fence loop visible.
 - **The internal listener stays internal.** `:8081` (peer protocol plus an
   *unauthenticated* operator API) is reachable only from fleet pods and the
-  operator's namespace via NetworkPolicy, reinforced by an Istio
+  selected manager pods in the operator namespace via NetworkPolicy, reinforced by an Istio
   AuthorizationPolicy when Istio is installed, and is never routed.
 - **Peers can reach draining pods** (`publishNotReadyAddresses` on the
   headless service) so cell handoff works while a node reports unready.
-- **Drain 503s are retried at the gateway**, making rollouts invisible to
-  clients; WebSocket routes get their request timeout disabled so hibernated
-  sockets aren't severed.
+- **Gateway retries depend on the ingress implementation.** HTTPRoute retries require opt-in and experimental CRDs; clients must otherwise tolerate drain 503s. WebSocket routes disable request timeouts.
 - **PDB `maxUnavailable: 1`** keeps node maintenance as serialized as
   rollouts.
 

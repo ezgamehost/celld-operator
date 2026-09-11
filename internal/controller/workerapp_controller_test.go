@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -112,7 +114,7 @@ var _ = Describe("WorkerApp Controller", func() {
 			// the next spec starts clean.
 			for _, obj := range []client.Object{
 				&appsv1.StatefulSet{}, &corev1.Service{}, &corev1.ServiceAccount{},
-				&networkingv1.NetworkPolicy{}, &policyv1.PodDisruptionBudget{},
+				&networkingv1.NetworkPolicy{}, &policyv1.PodDisruptionBudget{}, &networkingv1.Ingress{},
 			} {
 				if err := k8sClient.Get(ctx, fleetKey, obj); err == nil {
 					Expect(k8sClient.Delete(ctx, obj)).To(Succeed())
@@ -121,6 +123,46 @@ var _ = Describe("WorkerApp Controller", func() {
 			internal := &corev1.Service{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: resourceNamespace, Name: resourceName + "-celld-internal"}, internal); err == nil {
 				Expect(k8sClient.Delete(ctx, internal)).To(Succeed())
+			}
+		})
+
+		It("should validate DNS subdomain label and total length boundaries", func() {
+			valid := []string{"cluster.local", "a", strings.Repeat("a", 63) + ".local", strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 61)}
+			invalid := []string{"", "a..b", "a.-b", "a-.b", "a.", ".a", strings.Repeat("a", 64) + ".local", strings.Repeat(strings.Repeat("a", 63)+".", 3) + strings.Repeat("b", 62)}
+			for _, domain := range valid {
+				app := &platformv1alpha1.WorkerApp{}
+				Expect(k8sClient.Get(ctx, typeNamespacedName, app)).To(Succeed())
+				app.Spec.ClusterDomain = domain
+				Expect(k8sClient.Update(ctx, app)).To(Succeed(), domain)
+			}
+			for _, domain := range invalid {
+				// A raw patch retains empty strings rather than omitting the field.
+				app := &platformv1alpha1.WorkerApp{}
+				Expect(k8sClient.Get(ctx, typeNamespacedName, app)).To(Succeed())
+				patch := client.RawPatch(types.MergePatchType, fmt.Appendf(nil, `{"spec":{"clusterDomain":%q}}`, domain))
+				Expect(errors.IsInvalid(k8sClient.Patch(ctx, app, patch))).To(BeTrue(), domain)
+			}
+		})
+
+		It("should reject unsafe admission and immutable migrations", func() {
+			cases := map[string]func(*platformv1alpha1.WorkerApp){
+				"bucket migration":    func(a *platformv1alpha1.WorkerApp) { a.Spec.Bucket.Name = "s3://other/app" },
+				"storage migration":   func(a *platformv1alpha1.WorkerApp) { a.Spec.Storage = &platformv1alpha1.StorageSpec{SizeGi: 10} },
+				"uncredentialed auto": func(a *platformv1alpha1.WorkerApp) { a.Spec.AppVersion = AppVersionAuto },
+				"contradictory credentials": func(a *platformv1alpha1.WorkerApp) {
+					a.Spec.Bucket.CredentialsFrom.IAMRole = iamRoleAuto
+					a.Spec.Bucket.CredentialsFrom.SecretRef = "credentials"
+				},
+				"autoscaling bounds": func(a *platformv1alpha1.WorkerApp) {
+					a.Spec.Autoscaling = &platformv1alpha1.AutoscalingSpec{Enabled: true, MinReplicas: 10, MaxReplicas: 3}
+				},
+			}
+			for name, mutate := range cases {
+				By(name)
+				app := &platformv1alpha1.WorkerApp{}
+				Expect(k8sClient.Get(ctx, typeNamespacedName, app)).To(Succeed())
+				mutate(app)
+				Expect(errors.IsInvalid(k8sClient.Update(ctx, app))).To(BeTrue(), name)
 			}
 		})
 
@@ -201,7 +243,7 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(env["CELLD_ADVERTISE"]).To(ContainSubstring("test-resource-celld-internal"))
 			// Unset durability and forwarded-header trust leave celld's
 			// defaults alone rather than pinning them.
-			Expect(env).NotTo(HaveKey("CELLD_DURABILITY"))
+			Expect(env).To(HaveKeyWithValue("CELLD_DURABILITY", "bucket"))
 			Expect(env).NotTo(HaveKey("CELLD_TRUST_FORWARDED_HEADERS"))
 			// Fleet durability keeps acknowledged writes on follower disks
 			// until tiered (F13): spread the pods across hosts, softly.
@@ -309,8 +351,8 @@ var _ = Describe("WorkerApp Controller", func() {
 			resource := &platformv1alpha1.WorkerApp{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			resource.Spec.AppVersion = AppVersionAuto
-			// Point at an unreachable endpoint so the pointer read fails.
-			resource.Spec.Bucket.Endpoint = "http://127.0.0.1:1"
+			// A missing dedicated credential makes the pointer read fail safely.
+			resource.Spec.DeployTrackingSecretRef = "missing-tracking"
 			resource.Spec.Bucket.CredentialsFrom.SecretRef = ""
 			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
 
@@ -343,9 +385,12 @@ var _ = Describe("WorkerApp Controller", func() {
 			}
 			resource.Spec.Durability = platformv1alpha1.DurabilityBucket
 			resource.Spec.TrustForwardedHeaders = true
-			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			resource.ObjectMeta = metav1.ObjectMeta{Name: resourceName, Namespace: resourceNamespace}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 
 			r := reconciler()
+			r.AllowedAzureClientIDs = []string{"11111111-2222-3333-4444-555555555555"}
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 
@@ -374,14 +419,7 @@ var _ = Describe("WorkerApp Controller", func() {
 			By("refusing appVersion auto, which reads the pointer over the S3 API only")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			resource.Spec.AppVersion = AppVersionAuto
-			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
-			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
-			Expect(err).NotTo(HaveOccurred())
-			updated := &platformv1alpha1.WorkerApp{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
-			cond := meta.FindStatusCondition(updated.Status.Conditions, condDeployTrackingReady)
-			Expect(cond).NotTo(BeNil())
-			Expect(cond.Reason).To(Equal("UnsupportedStore"))
+			Expect(errors.IsInvalid(k8sClient.Update(ctx, resource))).To(BeTrue())
 			// And the fleet keeps the version it was serving.
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(appVersionAnnotation, "sha-test"))
@@ -448,7 +486,7 @@ var _ = Describe("WorkerApp Controller", func() {
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImageOld))
 		})
 
-		It("should refuse a rolling downgrade from v0.4 to v0.2 and surface every hazard on Recreate", func() {
+		It("should refuse a rolling downgrade from v0.4 to v0.2 even when Recreate is requested", func() {
 			r := reconciler()
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
@@ -464,23 +502,22 @@ var _ = Describe("WorkerApp Controller", func() {
 			updated := &platformv1alpha1.WorkerApp{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
 			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseDegraded))
-			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("sealed epoch"))
-			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("peer tunnel"))
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("offline durability verification"))
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testCelldImage))
 
-			By("proceeding only once the CR says Recreate, and saying what the stop protects")
+			By("refusing the unsafe downgrade even when Recreate is requested")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
 			resource.Spec.Celld.UpdateStrategy = platformv1alpha1.UpdateStrategyRecreate
 			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
 			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updated)).To(Succeed())
-			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseRecreating))
-			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("sealed epoch"))
+			Expect(updated.Status.Phase).To(Equal(platformv1alpha1.PhaseDegraded))
+			Expect(updated.Status.Rollout.WaitingOn).To(ContainSubstring("offline durability verification"))
 			Expect(k8sClient.Get(ctx, fleetKey, sts)).To(Succeed())
-			Expect(*sts.Spec.Replicas).To(BeZero())
+			Expect(*sts.Spec.Replicas).To(Equal(int32(3)))
 		})
 	})
 })

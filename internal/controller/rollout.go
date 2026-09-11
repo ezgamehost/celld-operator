@@ -28,8 +28,12 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -294,6 +298,21 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 	oldImage := stsContainerImage(&existing)
 	imageChanged := oldImage != "" && oldImage != app.Spec.Celld.Image
 
+	if templateChanged || stsPartition(&existing) > 0 || existing.Annotations[recreateAnnotation] == annotationTrue || (!autoscalingEnabled(app) && ptr.Deref(existing.Spec.Replicas, 0) != desiredReplicas(app)) {
+		paused, err := r.pauseScaling(ctx, app)
+		if err != nil {
+			return fleetOutcome{}, err
+		}
+		if !paused {
+			return fleetOutcome{Phase: platformv1alpha1.PhaseRollingOut, WaitingOn: "waiting for KEDA pause and HPA removal", Requeue: 5 * time.Second}, nil
+		}
+	}
+	if refusal := runtimeChangeRefusal(app, oldImage); refusal != "" {
+		return fleetOutcome{Phase: platformv1alpha1.PhaseDegraded, WaitingOn: refusal, Requeue: time.Minute}, nil
+	}
+	if existing.Annotations[recreateAnnotation] == annotationTrue {
+		return r.recreateStep(ctx, app, &existing, desired, "")
+	}
 	if templateChanged {
 		var breaking string
 		if imageChanged {
@@ -310,7 +329,7 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 					oldImage, app.Spec.Celld.Image, breaking),
 			}, nil
 		}
-		if imageChanged && app.Spec.Celld.UpdateStrategy == platformv1alpha1.UpdateStrategyRecreate {
+		if app.Spec.Celld.UpdateStrategy == platformv1alpha1.UpdateStrategyRecreate {
 			return r.recreateStep(ctx, app, &existing, desired, breaking)
 		}
 		// Start a gated rolling update: apply the new template frozen at
@@ -321,6 +340,7 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 			existing.Annotations = map[string]string{}
 		}
 		existing.Annotations[templateHashAnnotation] = desiredHash
+		existing.Annotations[settleAnnotation] = time.Now().Add(10 * time.Second).UTC().Format(time.RFC3339Nano)
 		setStsPartition(&existing, liveReplicas)
 		if conflict, err := r.updateFleet(ctx, &existing); err != nil {
 			return fleetOutcome{}, err
@@ -338,29 +358,7 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 		return r.rolloutStep(ctx, app, &existing)
 	}
 
-	// Steady state. Scale is ours only when KEDA does not own it.
-	if !autoscalingEnabled(app) && ptr.Deref(existing.Spec.Replicas, 0) != desiredReplicas(app) {
-		existing.Spec.Replicas = ptr.To(desiredReplicas(app))
-		if conflict, err := r.updateFleet(ctx, &existing); err != nil {
-			return fleetOutcome{}, err
-		} else if conflict {
-			return conflictOutcome(app), nil
-		}
-		return fleetOutcome{Phase: platformv1alpha1.PhasePending, Requeue: 10 * time.Second}, nil
-	}
-
-	liveReplicas := ptr.Deref(existing.Spec.Replicas, 0)
-	converged := existing.Status.ReadyReplicas == liveReplicas &&
-		existing.Status.UpdatedReplicas == liveReplicas &&
-		existing.Status.ObservedGeneration == existing.Generation
-	if !converged {
-		return fleetOutcome{
-			Phase:     platformv1alpha1.PhasePending,
-			WaitingOn: fmt.Sprintf("fleet: %d/%d ready", existing.Status.ReadyReplicas, liveReplicas),
-			Requeue:   15 * time.Second,
-		}, nil
-	}
-	return fleetOutcome{Phase: platformv1alpha1.PhaseReady, RolledOut: true, Requeue: 5 * time.Minute}, nil
+	return r.steadyFleet(ctx, app, &existing, appVersion)
 }
 
 // rolloutStep advances a gated rolling update by at most one ordinal.
@@ -380,6 +378,15 @@ func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1al
 	}
 	out := fleetOutcome{Phase: platformv1alpha1.PhaseRollingOut, Partition: partition, Requeue: 10 * time.Second}
 
+	if partition <= 0 || sts.Status.ObservedGeneration != sts.Generation {
+		out.WaitingOn = "waiting for StatefulSet observation"
+		return out, nil
+	}
+	if deadline, err := time.Parse(time.RFC3339Nano, sts.Annotations[settleAnnotation]); err == nil && time.Now().Before(deadline) {
+		out.WaitingOn = "waiting for rollout settle interval"
+		out.Requeue = time.Until(deadline)
+		return out, nil
+	}
 	// Gate 1: every already-released ordinal (>= partition) runs the new
 	// revision and is Ready.
 	if sts.Status.UpdateRevision == "" {
@@ -403,42 +410,21 @@ func (r *WorkerAppReconciler) rolloutStep(ctx context.Context, app *platformv1al
 		}
 	}
 
-	// Gate 2: fleet-wide restoring == 0, from a live sweep of every pod's
-	// internal /state. The cold work lands on the peers, so the whole fleet
-	// is polled. A pod that is Ready but unreachable holds the gate — never
-	// step on missing data. A pod that is unreachable AND not Ready holds
-	// no cells (celld is not serving) and is skipped: otherwise a fleet
-	// that was never healthy could never roll out the fix for what broke
-	// it, and the gate becomes a deadlock.
-	var pods corev1.PodList
-	if err := r.List(ctx, &pods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app))); err != nil {
-		return fleetOutcome{}, err
-	}
-	var restoring int64
-	for i := range pods.Items {
-		pod := &pods.Items[i]
-		if pod.Status.PodIP == "" || pod.Status.Phase != corev1.PodRunning {
-			continue
-		}
-		state, err := r.State.Fetch(ctx, pod.Status.PodIP)
-		if err != nil {
-			if podReady(pod) {
-				out.WaitingOn = fmt.Sprintf("state unreachable: pod %s: %v", pod.Name, err)
-				out.Requeue = 15 * time.Second
-				return out, nil
-			}
-			continue
-		}
-		restoring += state.Restoring
-	}
-	if restoring > 0 {
-		out.WaitingOn = fmt.Sprintf("fleet: restoring=%d", restoring)
-		out.Requeue = 15 * time.Second
+	// Require every expected ordinal, including old pods, to answer a valid
+	// live state request. Recreate is the explicit recovery path for a fleet
+	// too unhealthy to satisfy the rolling safety contract.
+	_, restoring, err := r.observeFleet(ctx, app, sts)
+	if err != nil || restoring != 0 {
+		out.WaitingOn = fmt.Sprintf("fleet state: restoring=%d, error=%v", restoring, err)
 		return out, nil
 	}
 
 	// Both gates pass: release the next ordinal.
 	partition--
+	if sts.Annotations == nil {
+		sts.Annotations = map[string]string{}
+	}
+	sts.Annotations[settleAnnotation] = time.Now().Add(10 * time.Second).UTC().Format(time.RFC3339Nano)
 	setStsPartition(sts, partition)
 	if conflict, err := r.updateFleet(ctx, sts); err != nil {
 		return fleetOutcome{}, err
@@ -466,6 +452,10 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 	// Phase A: scale the OLD template to zero and let every node drain.
 	if ptr.Deref(existing.Spec.Replicas, 0) != 0 {
 		existing.Spec.Replicas = ptr.To(int32(0))
+		if existing.Annotations == nil {
+			existing.Annotations = map[string]string{}
+		}
+		existing.Annotations[recreateAnnotation] = annotationTrue
 		if conflict, err := r.updateFleet(ctx, existing); err != nil {
 			return fleetOutcome{}, err
 		} else if conflict {
@@ -477,7 +467,11 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 		}
 		return out, nil
 	}
-	if existing.Status.Replicas > 0 {
+	var oldPods corev1.PodList
+	if err := r.Reader.List(ctx, &oldPods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app))); err != nil {
+		return out, err
+	}
+	if existing.Status.ObservedGeneration != existing.Generation || len(oldPods.Items) > 0 || existing.Status.Replicas > 0 {
 		out.WaitingOn = fmt.Sprintf("%d pods draining", existing.Status.Replicas)
 		return out, nil
 	}
@@ -488,6 +482,7 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 		existing.Annotations = map[string]string{}
 	}
 	existing.Annotations[templateHashAnnotation] = desired.Annotations[templateHashAnnotation]
+	delete(existing.Annotations, recreateAnnotation)
 	existing.Spec.Replicas = ptr.To(desiredReplicas(app))
 	setStsPartition(existing, 0)
 	if conflict, err := r.updateFleet(ctx, existing); err != nil {
@@ -500,10 +495,139 @@ func (r *WorkerAppReconciler) recreateStep(ctx context.Context, app *platformv1a
 }
 
 func podReady(pod *corev1.Pod) bool {
+	if !pod.DeletionTimestamp.IsZero() {
+		return false
+	}
 	for _, cond := range pod.Status.Conditions {
 		if cond.Type == corev1.PodReady {
 			return cond.Status == corev1.ConditionTrue
 		}
 	}
 	return false
+}
+
+const settleAnnotation = "celld-operator.io/settle-until"
+const recreateAnnotation = "celld-operator.io/recreating"
+
+func (r *WorkerAppReconciler) observeFleet(ctx context.Context, app *platformv1alpha1.WorkerApp, sts *appsv1.StatefulSet) (map[string]*PodState, int64, error) {
+	var pods corev1.PodList
+	if err := r.Reader.List(ctx, &pods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app))); err != nil {
+		return nil, 0, err
+	}
+	expected := ptr.Deref(sts.Spec.Replicas, 0)
+	if expected < 1 || int32(len(pods.Items)) != expected {
+		return nil, 0, fmt.Errorf("expected %d pods, found %d", expected, len(pods.Items))
+	}
+	names := map[string]bool{}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, sts) || !podReady(pod) {
+			return nil, 0, fmt.Errorf("pod %s is not ready or not owned by the fleet", pod.Name)
+		}
+		names[pod.Name] = true
+	}
+	for i := range expected {
+		if !names[fmt.Sprintf("%s-%d", sts.Name, i)] {
+			return nil, 0, fmt.Errorf("missing ordinal %d", i)
+		}
+	}
+	return r.State.FleetSweep(ctx, pods.Items)
+}
+
+// KEDA v2.12.0 or newer is required for the Paused=True acknowledgement.
+// KEDA acknowledges a full pause only after stopping its scale loop and
+// deleting its HPA. Independently check that no HPA still targets this fleet.
+func (r *WorkerAppReconciler) pauseScaling(ctx context.Context, app *platformv1alpha1.WorkerApp) (bool, error) {
+	obj := newUnstructuredObject("keda.sh/v1alpha1", "ScaledObject", fleetName(app), app.Namespace, nil, nil, nil)
+	err := r.Reader.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+	if !autoscalingEnabled(app) {
+		if err == nil {
+			var conditions []metav1.Condition
+			if r.ensureScaledObject(ctx, app, fleetOutcome{}, &conditions) {
+				return false, fmt.Errorf("could not remove disabled scaler")
+			}
+			return false, nil
+		}
+		if !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
+			return false, err
+		}
+	} else if !meta.IsNoMatchError(err) {
+		if err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		if apierrors.IsNotFound(err) || obj.GetAnnotations()[kedaPausedAnnotation] != annotationTrue {
+			desired := buildScaledObject(app, r.PrometheusURL, true)
+			return false, r.ensureUnstructured(ctx, app, desired)
+		}
+		if err := requireOwnership(app, obj); err != nil {
+			return false, err
+		}
+		conditions, _, _ := unstructured.NestedSlice(obj.Object, "status", "conditions")
+		paused := false
+		for _, item := range conditions {
+			if cond, ok := item.(map[string]any); ok && cond["type"] == "Paused" && cond["status"] == "True" {
+				paused = true
+			}
+		}
+		if !paused {
+			return false, nil
+		}
+	}
+	var hpas autoscalingv2.HorizontalPodAutoscalerList
+	if err := r.Reader.List(ctx, &hpas, client.InNamespace(app.Namespace)); err != nil {
+		return false, err
+	}
+	for _, hpa := range hpas.Items {
+		if hpa.Spec.ScaleTargetRef.Kind == "StatefulSet" && hpa.Spec.ScaleTargetRef.Name == fleetName(app) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (r *WorkerAppReconciler) steadyFleet(ctx context.Context, app *platformv1alpha1.WorkerApp, existing *appsv1.StatefulSet, appVersion string) (fleetOutcome, error) {
+	// Steady state. Scale is ours only when KEDA does not own it.
+	if !autoscalingEnabled(app) && ptr.Deref(existing.Spec.Replicas, 0) != desiredReplicas(app) {
+		existing.Spec.Replicas = ptr.To(desiredReplicas(app))
+		if conflict, err := r.updateFleet(ctx, existing); err != nil {
+			return fleetOutcome{}, err
+		} else if conflict {
+			return conflictOutcome(app), nil
+		}
+		return fleetOutcome{Phase: platformv1alpha1.PhasePending, Requeue: 10 * time.Second}, nil
+	}
+
+	liveReplicas := ptr.Deref(existing.Spec.Replicas, 0)
+	converged := existing.Status.ReadyReplicas == liveReplicas &&
+		existing.Status.UpdatedReplicas == liveReplicas &&
+		existing.Status.ObservedGeneration == existing.Generation
+	if !converged {
+		return fleetOutcome{
+			Phase:     platformv1alpha1.PhasePending,
+			WaitingOn: fmt.Sprintf("fleet: %d/%d ready", existing.Status.ReadyReplicas, liveReplicas),
+			Requeue:   15 * time.Second,
+		}, nil
+	}
+	states, restoring, err := r.observeFleet(ctx, app, existing)
+	if err != nil || restoring != 0 {
+		return fleetOutcome{Phase: platformv1alpha1.PhasePending, WaitingOn: fmt.Sprintf("waiting for complete fleet state: restoring=%d, error=%v", restoring, err), Requeue: 15 * time.Second}, nil
+	}
+	for name, state := range states {
+		if state.Deployment == nil || state.Deployment.Version != appVersion || len(state.Deployment.Draining) > 0 || state.Deployment.Swapping != 0 {
+			return fleetOutcome{Phase: platformv1alpha1.PhasePending, WaitingOn: name + ": deployment not converged", Requeue: 15 * time.Second}, nil
+		}
+	}
+	return fleetOutcome{Phase: platformv1alpha1.PhaseReady, RolledOut: true, Requeue: 30 * time.Second}, nil
+}
+
+func runtimeChangeRefusal(app *platformv1alpha1.WorkerApp, oldImage string) string {
+	from, fromOK := minorOf(oldImage)
+	to, toOK := minorOf(app.Spec.Celld.Image)
+	if fromOK && toOK && from.cmp(minorVersion{0, 3}) >= 0 && to.cmp(minorVersion{0, 3}) < 0 {
+		return "downgrade requires offline durability verification and migration to a new WorkerApp"
+	}
+	if oldImage != app.Spec.Celld.Image && (!fromOK || !toOK) && app.Spec.Celld.UpdateStrategy != platformv1alpha1.UpdateStrategyRecreate {
+		return "unrecognized live image requires Recreate"
+	}
+	return ""
 }

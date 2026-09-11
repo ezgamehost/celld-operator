@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -45,6 +46,12 @@ var (
 // By default, kuberc is disabled to ensure consistent test behavior across different environments.
 // To skip CertManager installation, set: CERT_MANAGER_INSTALL_SKIP=true
 func TestE2E(t *testing.T) {
+	cluster := os.Getenv("KIND_CLUSTER")
+	current, err := exec.Command("kubectl", "config", "current-context").Output()
+	if err != nil || (!strings.HasPrefix(cluster, "celld-operator-test-") && !strings.HasPrefix(cluster, "celld-operator-audit-")) || strings.TrimSpace(string(current)) != "kind-"+cluster {
+		t.Fatal("e2e requires the dedicated Kind context selected by make test-e2e")
+	}
+
 	RegisterFailHandler(Fail)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Starting celld-operator e2e test suite\n")
 	RunSpecs(t, "e2e suite")
@@ -62,6 +69,12 @@ var _ = BeforeSuite(func() {
 	err = utils.LoadImageToKindClusterWithName(managerImage)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
 
+	By("building and loading the deterministic lifecycle fixture")
+	cmd = exec.Command("docker", "build", "-f", "test/fixtures/runtime/Dockerfile", "-t", fixtureImage, "-t", fixtureNextImage, ".")
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(utils.LoadImageToKindClusterWithName(fixtureImage)).To(Succeed())
+	Expect(utils.LoadImageToKindClusterWithName(fixtureNextImage)).To(Succeed())
 	configureKubectlKubeRC()
 	setupCertManager()
 })
