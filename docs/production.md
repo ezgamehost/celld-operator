@@ -42,10 +42,12 @@ old fleet, provision a new WorkerApp with the intended storage, and only then
 resume traffic. Never overlap fleets sharing a bucket prefix. Do not delete
 local state as a substitute for verifying bucket recovery.
 
-KEDA v2.12.0 or newer is required for the Paused=True acknowledgement.
-The operator pauses KEDA and waits for its acknowledgement and HPA removal before
-rolling changes. A stalled pause blocks rollout. Unmanaged HPAs targeting the
-same StatefulSet also block it. Recreate waits for all old pods, including
+When `spec.autoscaling.enabled` is true, autoscaling requires KEDA v2.12.0 or
+newer for the `Paused=True` acknowledgement. The operator pauses KEDA and waits
+for its acknowledgement and HPA removal before rolling changes; a stalled pause
+blocks rollout. Non-autoscaled WorkerApps use `spec.replicas` and require neither
+a KEDA ScaledObject nor a `Paused=True` acknowledgement. Unmanaged HPAs targeting
+the same StatefulSet still block rollout. Recreate waits for all old pods, including
 terminating pods, to disappear. It cannot prove a killed node sealed its log;
 downgrades from v0.3+ to older runtimes are therefore blocked even with Recreate.
 
