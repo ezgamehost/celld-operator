@@ -29,8 +29,22 @@ spec:
         - name: manager
           args:
             {{- range .Values.controllerManager.container.args }}
-            - {{ . }}
+            {{- if not (or (hasPrefix "--metrics-bind-address" .) (hasPrefix "--metrics-secure" .) (hasPrefix "--metrics-cert-path" .)) }}
+            - {{ . | quote }}
             {{- end }}
+            {{- end }}
+            - --metrics-bind-address={{ if .Values.metrics.enable }}:{{ .Values.metrics.port }}{{ else }}0{{ end }}
+            - --metrics-secure={{ not .Values.metrics.insecure }}
+            {{- if and .Values.certmanager.enable .Values.metrics.enable }}
+            {{- if .Values.metrics.insecure }}{{ fail "certmanager requires secure metrics" }}{{ end }}
+            - --metrics-cert-path=/tmp/k8s-metrics-server/metrics-certs
+            {{- end }}
+            - --watch-namespace={{ .Values.operator.watchNamespace }}
+            - {{ printf "--allowed-image-prefixes=%s" (join "," .Values.operator.allowedImagePrefixes) | quote }}
+            - {{ printf "--allowed-iam-roles=%s" (join "," .Values.operator.allowedIAMRoles) | quote }}
+            - {{ printf "--allowed-azure-client-ids=%s" (join "," .Values.operator.allowedAzureClientIDs) | quote }}
+            - {{ printf "--allowed-bucket-endpoints=%s" (join "," .Values.operator.allowedBucketEndpoints) | quote }}
+            - --httproute-retries={{ .Values.operator.httpRouteRetries }}
             - --ingress-mode={{ .Values.operator.ingressMode }}
             - --gateway-name={{ .Values.operator.gatewayName }}
             - --gateway-namespace={{ .Values.operator.gatewayNamespace }}

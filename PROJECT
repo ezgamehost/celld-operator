@@ -7,7 +7,9 @@ domain: celld-operator.io
 layout:
 - go.kubebuilder.io/v4
 plugins:
-  helm.kubebuilder.io/v1-alpha: {}
+  helm.kubebuilder.io/v2-alpha:
+    manifests: dist/install.yaml
+    output: dist
 projectName: celld-operator
 repo: github.com/ezgamehost/celld-operator
 resources:
@@ -16,8 +18,6 @@ resources:
     namespaced: true
   controller: true
   domain: celld-operator.io
-  group: ""
-  # Empty group: the CRD group is the domain itself (celld-operator.io).
   kind: WorkerApp
   path: github.com/ezgamehost/celld-operator/api/v1alpha1
   version: v1alpha1

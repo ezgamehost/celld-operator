@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	platformv1alpha1 "github.com/ezgamehost/celld-operator/api/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -63,6 +64,7 @@ var _ = BeforeSuite(func() {
 	err = platformv1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
+	Expect(gatewayv1.Install(scheme.Scheme)).To(Succeed())
 	// +kubebuilder:scaffold:scheme
 
 	By("bootstrapping test environment")

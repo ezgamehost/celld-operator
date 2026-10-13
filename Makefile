@@ -86,9 +86,13 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	esac
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+test-e2e: manifests generate fmt vet ## Run e2e in a newly created, isolated Kind cluster.
+	@case "$(KIND_CLUSTER)" in celld-operator-test-*|celld-operator-audit-*) ;; *) echo "Use a dedicated celld-operator-test-* cluster name" >&2; exit 1;; esac
+	@if $(KIND) get clusters | grep -Fxq "$(KIND_CLUSTER)"; then echo "Refusing to reuse an existing cluster" >&2; exit 1; fi
+	@set -e; task_kubeconfig=$$(mktemp); \
+	trap 'rm -f "$$task_kubeconfig"; $(KIND) delete cluster --name "$(KIND_CLUSTER)"' EXIT; \
+	$(KIND) create cluster --name "$(KIND_CLUSTER)" --kubeconfig "$$task_kubeconfig"; \
+	KUBECONFIG="$$task_kubeconfig" KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
@@ -257,3 +261,58 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+##@ Helm Deployment
+
+## Helm binary to use for deploying the chart
+HELM ?= helm
+## Namespace to deploy the Helm release
+HELM_NAMESPACE ?= celld-operator-system
+## Name of the Helm release
+HELM_RELEASE ?= celld-operator
+## Path to the Helm chart directory
+HELM_CHART_DIR ?= dist/chart
+## Additional arguments to pass to helm commands
+HELM_EXTRA_ARGS ?=
+
+.PHONY: install-helm
+install-helm: ## Require Helm v3.19.0, installing the pinned release if needed.
+	@set -e; \
+	if [ "$$($(HELM) version --template '{{.Version}}' 2>/dev/null || true)" != "v3.19.0" ]; then \
+		task_installer=$$(mktemp); trap 'rm -f "$$task_installer"' EXIT; \
+		curl -fsSL https://raw.githubusercontent.com/helm/helm/v3.19.0/scripts/get-helm-3 -o "$$task_installer"; \
+		printf '%s  %s\n' '4a01413bf2a767ae744b8bbe4485cd83654d9a0a769c92377afc36328d5a007a' "$$task_installer" | sha256sum -c -; \
+		DESIRED_VERSION=v3.19.0 bash "$$task_installer"; \
+	fi; \
+	test "$$($(HELM) version --template '{{.Version}}')" = "v3.19.0"
+
+.PHONY: helm-deploy
+helm-deploy: install-helm ## Deploy manager to the K8s cluster via Helm. Specify an image with IMG.
+	task_image="$(IMG)"; $(HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) \
+		--create-namespace \
+		--set controllerManager.container.image.repository="$${task_image%:*}" \
+		--set controllerManager.container.image.tag="$${task_image##*:}" \
+		--wait \
+		--timeout 5m \
+		$(HELM_EXTRA_ARGS)
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Uninstall the Helm release from the K8s cluster.
+	$(HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-status
+helm-status: ## Show Helm release status.
+	$(HELM) status $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-history
+helm-history: ## Show Helm release history.
+	$(HELM) history $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: helm-rollback
+helm-rollback: ## Rollback to previous Helm release.
+	$(HELM) rollback $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
+
+.PHONY: chart-sync
+chart-sync: manifests generate ## Refresh the customized Helm CRD and RBAC from controller-gen.
+	python3 hack/sync-chart.py

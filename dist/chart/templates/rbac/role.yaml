@@ -1,8 +1,11 @@
 {{- if .Values.rbac.enable }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
+kind: {{ if .Values.operator.watchNamespace }}Role{{ else }}ClusterRole{{ end }}
 metadata:
+  {{- with .Values.operator.watchNamespace }}
+  namespace: {{ . }}
+  {{- end }}
   labels:
     {{- include "chart.labels" . | nindent 4 }}
   name: celld-operator-manager-role
@@ -54,6 +57,46 @@ rules:
   - update
   - watch
 - apiGroups:
+  - autoscaling
+  resources:
+  - horizontalpodautoscalers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - celld-operator.io
+  resources:
+  - workerapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - celld-operator.io
+  resources:
+  - workerapps/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - celld-operator.io
+  resources:
+  - workerapps/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gateways
+  verbs:
+  - get
+- apiGroups:
   - gateway.networking.k8s.io
   resources:
   - httproutes
@@ -103,32 +146,6 @@ rules:
   - update
   - watch
 - apiGroups:
-  - celld-operator.io
-  resources:
-  - workerapps
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - celld-operator.io
-  resources:
-  - workerapps/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - celld-operator.io
-  resources:
-  - workerapps/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
   - policy
   resources:
   - poddisruptionbudgets
@@ -152,4 +169,4 @@ rules:
   - patch
   - update
   - watch
-{{- end -}}
+{{- end }}

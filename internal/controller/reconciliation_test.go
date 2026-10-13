@@ -58,7 +58,7 @@ func TestOwnershipCollisions(t *testing.T) {
 					obj = newUnstructuredObject("keda.sh/v1alpha1", kind, fleetName(app), app.Namespace, nil, nil, map[string]any{"sentinel": "preserve"})
 				}
 				if ownedByOther {
-					obj.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: platformv1alpha1.SchemeGroupVersion.String(), Kind: "WorkerApp", Name: app.Name, UID: "previous-app-uid", Controller: ptr.To(true)}})
+					obj.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: platformv1alpha1.SchemeGroupVersion.String(), Kind: testWorkerAppKind, Name: app.Name, UID: "previous-app-uid", Controller: ptr.To(true)}})
 				}
 				c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(obj).Build()
 				r := &WorkerAppReconciler{Client: c, Reader: c, Scheme: scheme}
@@ -103,7 +103,7 @@ func TestStateClientPodAddresses(t *testing.T) {
 				if req.URL.Host != address.host || req.URL.Path != "/state" {
 					t.Fatalf("unexpected URL %s", req.URL)
 				}
-				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"occupied":2,"restoring":1}`)), Header: make(http.Header)}, nil
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"occupied":2,"restoring":1,"shedding":null}`)), Header: make(http.Header)}, nil
 			})}}
 			state, err := c.Fetch(context.Background(), address.ip)
 			if err != nil {

@@ -28,7 +28,7 @@ spec:
   vars:
     secretRef: chat-vars
   websockets: true
-  # durability: fleet           # celld's default; "bucket" waits for the upload before acking
+  durability: bucket           # fleet requires storage and at least three replicas
   # trustForwardedHeaders: true # only behind a proxy that replaces X-Forwarded-Host and -Proto
   autoscaling:
     enabled: true

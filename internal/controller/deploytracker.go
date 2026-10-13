@@ -18,14 +18,16 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	appsv1 "k8s.io/api/apps/v1"
@@ -55,6 +57,8 @@ type deployPointer struct {
 type trackedVersion struct {
 	version   string
 	fetchedAt time.Time
+	identity  string
+	failure   error
 }
 
 // DeployTracker caches per-fleet bucket-pointer reads so reconciles don't
@@ -74,8 +78,7 @@ func NewDeployTracker(interval time.Duration) *DeployTracker {
 }
 
 // currentBucketVersion reads deploy/current.json from the fleet's bucket
-// using the fleet's own credentials (static keys from the secretRef, or the
-// operator's ambient AWS chain otherwise).
+// using an explicit read-only tracking Secret; never the ambient AWS chain.
 func (r *WorkerAppReconciler) currentBucketVersion(ctx context.Context, app *platformv1alpha1.WorkerApp) (string, error) {
 	spec := app.Spec.Bucket
 	rest, ok := strings.CutPrefix(spec.Name, "s3://")
@@ -88,27 +91,27 @@ func (r *WorkerAppReconciler) currentBucketVersion(ctx context.Context, app *pla
 		key = strings.TrimSuffix(prefix, "/") + "/" + key
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	ref := app.Spec.DeployTrackingSecretRef
+	if ref == "" {
+		return "", fmt.Errorf("deployTrackingSecretRef is required; ambient cloud credentials are never used")
+	}
+	var secret corev1.Secret
+	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: ref}, &secret); err != nil {
+		return "", fmt.Errorf("reading tracking credentials: %w", err)
+	}
+	if len(secret.Data["AWS_ACCESS_KEY_ID"]) == 0 || len(secret.Data["AWS_SECRET_ACCESS_KEY"]) == 0 {
+		return "", fmt.Errorf("tracking Secret requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
+	}
 	region := spec.Region
 	if region == "" {
-		region = defaultBucketRegion
-	}
-	loadOptions := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	if ref := spec.CredentialsFrom.SecretRef; ref != "" {
-		var secret corev1.Secret
-		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: ref}, &secret); err != nil {
-			return "", fmt.Errorf("reading bucket credentials %s: %w", ref, err)
+		region = "us-east-1"
+		if spec.Endpoint != "" {
+			region = defaultBucketRegion
 		}
-		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(
-				string(secret.Data["AWS_ACCESS_KEY_ID"]),
-				string(secret.Data["AWS_SECRET_ACCESS_KEY"]),
-				string(secret.Data["AWS_SESSION_TOKEN"]),
-			)))
 	}
-	cfg, err := awsconfig.LoadDefaultConfig(ctx, loadOptions...)
-	if err != nil {
-		return "", err
-	}
+	cfg := aws.Config{Region: region, Credentials: credentials.NewStaticCredentialsProvider(string(secret.Data["AWS_ACCESS_KEY_ID"]), string(secret.Data["AWS_SECRET_ACCESS_KEY"]), string(secret.Data["AWS_SESSION_TOKEN"])), RetryMaxAttempts: 2, HTTPClient: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 		if spec.Endpoint != "" {
 			o.BaseEndpoint = aws.String(spec.Endpoint)
@@ -121,8 +124,15 @@ func (r *WorkerAppReconciler) currentBucketVersion(ctx context.Context, app *pla
 		return "", fmt.Errorf("reading %s: %w", key, err)
 	}
 	defer func() { _ = out.Body.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(out.Body, (64<<10)+1))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > 64<<10 {
+		return "", fmt.Errorf("deploy pointer exceeds 64 KiB")
+	}
 	var pointer deployPointer
-	if err := json.NewDecoder(out.Body).Decode(&pointer); err != nil {
+	if err := json.Unmarshal(raw, &pointer); err != nil {
 		return "", fmt.Errorf("decoding %s: %w", key, err)
 	}
 	if pointer.Version == "" {
@@ -138,24 +148,43 @@ func (r *WorkerAppReconciler) pointerVersion(ctx context.Context, app *platformv
 	key := types.NamespacedName{Namespace: app.Namespace, Name: app.Name}
 	tracker := r.Deploys
 
+	var secret corev1.Secret
+	if ref := app.Spec.DeployTrackingSecretRef; ref != "" {
+		if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: app.Namespace, Name: ref}, &secret); err != nil {
+			return "", false, err
+		}
+	}
+	identityBytes, _ := json.Marshal([]any{app.UID, app.Spec.Bucket, app.Spec.DeployTrackingSecretRef, secret.UID, secret.ResourceVersion})
+	identity := fmt.Sprintf("%x", sha256.Sum256(identityBytes))
 	tracker.mu.Lock()
 	cached, have := tracker.cache[key]
+	have = have && cached.identity == identity
 	tracker.mu.Unlock()
 	if have && time.Since(cached.fetchedAt) < tracker.Interval {
-		return cached.version, false, nil
+		return cached.version, cached.failure != nil && cached.version != "", cached.failure
 	}
-
 	fresh, err := r.currentBucketVersion(ctx, app)
-	if err != nil {
-		if have {
-			return cached.version, true, err
-		}
-		return "", false, err
+	if err != nil && have {
+		fresh = cached.version
 	}
 	tracker.mu.Lock()
-	tracker.cache[key] = trackedVersion{version: fresh, fetchedAt: time.Now()}
+	// Bound memory even when deletes are missed while the manager is offline.
+	if len(tracker.cache) >= 1024 {
+		for k, v := range tracker.cache {
+			if time.Since(v.fetchedAt) >= tracker.Interval {
+				delete(tracker.cache, k)
+			}
+		}
+		if len(tracker.cache) >= 1024 {
+			for k := range tracker.cache {
+				delete(tracker.cache, k)
+				break
+			}
+		}
+	}
+	tracker.cache[key] = trackedVersion{version: fresh, fetchedAt: time.Now(), identity: identity, failure: err}
 	tracker.mu.Unlock()
-	return fresh, false, nil
+	return fresh, err != nil && fresh != "", err
 }
 
 // trackableBucket reports whether the operator can read the fleet's deploy
@@ -188,7 +217,7 @@ func (r *WorkerAppReconciler) resolveAppVersion(ctx context.Context, app *platfo
 		// static credentials: nodes load what current.json names, so a
 		// pinned version that disagrees with the bucket is a lie waiting
 		// to be served.
-		if app.Spec.Bucket.CredentialsFrom.SecretRef != "" {
+		if app.Spec.DeployTrackingSecretRef != "" {
 			if current, _, err := r.pointerVersion(ctx, app); err == nil && current != app.Spec.AppVersion {
 				*conditions = append(*conditions, metav1.Condition{
 					Type: condDeployTrackingReady, Status: metav1.ConditionFalse,
@@ -233,4 +262,13 @@ func (r *WorkerAppReconciler) liveTemplateVersion(ctx context.Context, app *plat
 		return ""
 	}
 	return sts.Spec.Template.Annotations[appVersionAnnotation]
+}
+
+func (t *DeployTracker) Forget(key types.NamespacedName) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	delete(t.cache, key)
+	t.mu.Unlock()
 }
