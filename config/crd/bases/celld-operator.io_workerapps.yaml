@@ -402,7 +402,7 @@ spec:
                   otlpEndpoint:
                     description: |-
                       otlpEndpoint is the collector base URL for the otlp sink
-                      (OTEL_EXPORTER_OTLP_ENDPOINT), e.g. "http://otel-collector.monitoring.svc:4318".
+                      (CELLD_OTEL in celld v0.5+), e.g. "http://otel-collector.monitoring.svc:4318".
                       Setting it without a sink selects the otlp sink.
                     type: string
                   retention:
@@ -433,7 +433,9 @@ spec:
                   X-Forwarded-Host), since celld takes the last value of each.
                 type: boolean
               vars:
-                description: VarsSpec supplies Worker variables and secrets.
+                description: |-
+                  VarsSpec supplies Worker variables and secrets for celld before v0.5.
+                  Newer runtimes require vars in the deployment's Wrangler configuration.
                 properties:
                   secretRef:
                     description: |-

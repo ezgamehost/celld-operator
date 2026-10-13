@@ -62,7 +62,9 @@ func TestIsBreakingUpgrade(t *testing.T) {
 		{"a tag without a minor is not refused", "ghcr.io/denoland/celld:v1", v04, false, ""},
 		{"registry with a port still parses the tag", "registry:5000/celld:v0.1.0", "registry:5000/celld:v0.2.0", true, reasonMixedFleet},
 		{"a tag with a digest suffix parses before the digest", "registry:5000/celld:v0.1.0@sha256:7c222fb2927d828af22f592134e8932480637c0d7f076771e81cf2acd7204ecf", "registry:5000/celld:v0.2.0", true, reasonMixedFleet},
-		{"a future minor with no flagged boundary", v04, "ghcr.io/denoland/celld:v0.5.0", false, ""},
+		{"v0.4 to v0.5 requires stop-all", v04, "ghcr.io/denoland/celld:v0.5.0", true, reasonMixedFleet},
+		{"v0.5 to v0.4 requires stop-all", "ghcr.io/denoland/celld:v0.5.1", v04, true, reasonMixedFleet},
+		{"skipping to latest still crosses v0.5", v04, "ghcr.io/denoland/celld:v0.6.2", true, reasonMixedFleet},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

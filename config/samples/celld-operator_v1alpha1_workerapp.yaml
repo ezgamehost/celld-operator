@@ -9,7 +9,7 @@ spec:
   hostnames: ["chat.acme.ezghcloud.com"]
   appVersion: sha-abc123
   celld:
-    image: ghcr.io/denoland/celld:v0.4.0
+    image: ghcr.io/denoland/celld:v0.6.2
     updateStrategy: Rolling
   replicas: 3
   bucket:
@@ -25,8 +25,6 @@ spec:
   resources:
     memoryGi: 8
     maxResidentCells: 1000
-  vars:
-    secretRef: chat-vars
   websockets: true
   durability: bucket           # fleet requires storage and at least three replicas
   # trustForwardedHeaders: true # only behind a proxy that replaces X-Forwarded-Host and -Proto

@@ -40,8 +40,8 @@ func (r *WorkerAppReconciler) validateApp(app *platformv1alpha1.WorkerApp) error
 			return fmt.Errorf("invalid Secret reference")
 		}
 	}
-	if app.Spec.Vars != nil && (app.Spec.Vars.SecretRef == "" || len(validation.IsDNS1123Subdomain(app.Spec.Vars.SecretRef)) > 0) {
-		return fmt.Errorf("vars.secretRef is required and must be a Secret name")
+	if err := validateVars(app); err != nil {
+		return err
 	}
 	if desiredReplicas(app) < 1 || app.Spec.Resources.MemoryGi < 0 || app.Spec.Resources.MemoryGi > 65536 {
 		return fmt.Errorf("invalid replica or memory configuration")
@@ -93,6 +93,16 @@ func (r *WorkerAppReconciler) validateTrust(app *platformv1alpha1.WorkerApp) err
 		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || !slices.Contains(r.AllowedBucketEndpoints, endpoint) {
 			return fmt.Errorf("bucket endpoint must be an explicitly allowed HTTPS URL without credentials, query, or fragment")
 		}
+	}
+	return nil
+}
+
+func validateVars(app *platformv1alpha1.WorkerApp) error {
+	if app.Spec.Vars != nil && (app.Spec.Vars.SecretRef == "" || len(validation.IsDNS1123Subdomain(app.Spec.Vars.SecretRef)) > 0) {
+		return fmt.Errorf("vars.secretRef is required and must be a Secret name")
+	}
+	if version, ok := minorOf(app.Spec.Celld.Image); ok && version.cmp(minorVersion{0, 5}) >= 0 && app.Spec.Vars != nil {
+		return fmt.Errorf("vars.secretRef is unsupported by celld v0.5+; move vars into the deployment's Wrangler configuration and remove spec.vars")
 	}
 	return nil
 }

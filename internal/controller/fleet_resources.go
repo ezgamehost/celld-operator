@@ -68,7 +68,6 @@ const (
 	// v0.4 bounds the complete process stop separately from the handoff
 	// no-progress interval. Pin that bound and leave Kubernetes enough
 	// headroom to finish celld's local durability shutdown.
-	shutdownDrainMs   = 25000
 	shutdownTotalMs   = 40000
 	terminationGraceS = 60
 
@@ -168,7 +167,6 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 			"$(POD_NAME).%s.%s.svc.%s:%d",
 			internalServiceName(app), app.Namespace, clusterDomain(app), internalPort)},
 		{Name: "CELLD_WATCH", Value: watchDir},
-		{Name: "CELLD_SHUTDOWN_DRAIN_MS", Value: fmt.Sprintf("%d", shutdownDrainMs)},
 		{Name: "CELLD_SHUTDOWN_TOTAL_MS", Value: fmt.Sprintf("%d", shutdownTotalMs)},
 		{Name: "CELLD_MAX_RESIDENT_CELLS", Value: fmt.Sprintf("%d", maxResidentCells(app))},
 		{Name: "CELLD_MAX_RSS_MB", Value: fmt.Sprintf("%d", rssMb)},
@@ -202,13 +200,26 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 	}
 	telemetryOn := app.Spec.Telemetry.Enabled == nil || *app.Spec.Telemetry.Enabled
 	if telemetryOn {
-		env = append(env, corev1.EnvVar{Name: "CELLD_OTEL", Value: "1"})
+		otelValue := "1"
+		version, knownVersion := minorOf(app.Spec.Celld.Image)
+		legacyTelemetry := knownVersion && version.cmp(minorVersion{0, 5}) < 0
+		if app.Spec.Telemetry.ResolvedSink() == platformv1alpha1.TelemetrySinkOTLP && !legacyTelemetry {
+			otelValue = app.Spec.Telemetry.OTLPEndpoint
+			if otelValue == "" {
+				otelValue = "http://localhost:4318"
+			}
+		}
+		env = append(env, corev1.EnvVar{Name: "CELLD_OTEL", Value: otelValue})
 		// Per-app service name: on a shared collector, "celld" (the
 		// upstream default) would flatten every fleet into one service.
 		env = append(env, corev1.EnvVar{Name: "OTEL_SERVICE_NAME", Value: app.Name})
 		if app.Spec.Telemetry.ResolvedSink() == platformv1alpha1.TelemetrySinkOTLP {
-			env = append(env, corev1.EnvVar{Name: "CELLD_OTEL_SINK", Value: "otlp"})
-			if app.Spec.Telemetry.OTLPEndpoint != "" {
+			// v0.5+ rejects CELLD_OTEL_SINK at startup and takes the URL
+			// directly in CELLD_OTEL. Keep the old contract for older tags.
+			if legacyTelemetry {
+				env = append(env, corev1.EnvVar{Name: "CELLD_OTEL_SINK", Value: "otlp"})
+			}
+			if legacyTelemetry && app.Spec.Telemetry.OTLPEndpoint != "" {
 				env = append(env, corev1.EnvVar{
 					Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: app.Spec.Telemetry.OTLPEndpoint,
 				})

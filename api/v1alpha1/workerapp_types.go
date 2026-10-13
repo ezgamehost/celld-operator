@@ -158,7 +158,8 @@ type ResourcesSpec struct {
 	MaxResidentCells int32 `json:"maxResidentCells,omitempty"`
 }
 
-// VarsSpec supplies Worker variables and secrets.
+// VarsSpec supplies Worker variables and secrets for celld before v0.5.
+// Newer runtimes require vars in the deployment's Wrangler configuration.
 type VarsSpec struct {
 	// secretRef names a Secret whose data is mounted and passed via
 	// CELLD_VARS_FILE. Rotation is a Secret update plus an ordinary gated
@@ -259,7 +260,7 @@ type TelemetrySpec struct {
 	Sink TelemetrySink `json:"sink,omitempty"`
 
 	// otlpEndpoint is the collector base URL for the otlp sink
-	// (OTEL_EXPORTER_OTLP_ENDPOINT), e.g. "http://otel-collector.monitoring.svc:4318".
+	// (CELLD_OTEL in celld v0.5+), e.g. "http://otel-collector.monitoring.svc:4318".
 	// Setting it without a sink selects the otlp sink.
 	// +optional
 	OTLPEndpoint string `json:"otlpEndpoint,omitempty"`

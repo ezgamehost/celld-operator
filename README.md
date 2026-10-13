@@ -13,7 +13,7 @@ policy, ingress, gated rollouts, metrics, and autoscaling.
 **Documentation: [celld-operator.io](https://celld-operator.io)** — installation,
 the WorkerApp reference, networking, autoscaling, and operations guides.
 
-> **Status: alpha.** celld itself is an alpha and this operator tracks it
+> **Status: alpha.** celld v0.6.2 is beta and this operator tracks it
 > release-for-release. The celld behaviors the operator encodes are indexed
 > in [docs/celld-behaviors.md](docs/celld-behaviors.md); this README is the
 > operational guide.
@@ -125,7 +125,7 @@ spec:
   hostnames: ["chat.acme.example.com"]   # routed via the shared Gateway
   appVersion: sha-abc123                 # which bucket deployment is live
   celld:
-    image: ghcr.io/denoland/celld:v0.4.0
+    image: ghcr.io/denoland/celld:v0.6.2
     updateStrategy: Rolling              # Recreate for non-rolling celld version changes
   replicas: 3
   bucket:
@@ -142,8 +142,6 @@ spec:
   resources:
     memoryGi: 8                          # ~1000 resident cells per 8 GiB
     maxResidentCells: 1000
-  vars:
-    secretRef: chat-vars                 # Secret with key "vars.env" (NAME=value lines) -> CELLD_VARS_FILE
   # service:                             # shape the serving Service; internal-only apps need no
   #   type: ClusterIP                    # hostnames at all — consumers use <app>-celld.<ns>.svc:8080
   #   annotations: {}                    # or LoadBalancer + annotations for a private LB
@@ -236,6 +234,23 @@ SIGKILL.
 | v0.2.1 → v0.3.0 | **Yes** | A v0.3 node that cannot replicate to a v0.2 peer falls back to bucket proofs until the peer upgrades |
 | v0.3 → v0.2 | Blocked, including Recreate | A v0.2 binary cannot read writes still waiting in v0.3 replicated logs or bundle objects; pod disappearance does not prove sealing |
 | v0.3 ↔ v0.4 | No, either direction | v0.4's versioned peer tunnel refuses v0.3 peers, and v0.3 cannot read v0.4's epoch-qualified large Workers KV value references. Use `Recreate`: stop every v0.3 node before starting v0.4 |
+| v0.4 ↔ v0.5 | No, either direction | v0.5 requires stopping the whole fleet first; use `Recreate` |
+| v0.5 ↔ v0.6 | Only with bucket durability on both sides | v0.6 changes fleet replication streams; if either pod template uses fleet durability, use `Recreate` |
+| v0.6.0 → v0.6.1 → v0.6.2 | **Yes** | Finish the runtime upgrade before enabling features that require the newer release |
+
+Do not downgrade to v0.4.0 after paged restore has activated on v0.4.1+:
+the older runtime cannot restore paged cells. Before rolling back from v0.6.1+,
+remove Python deployments and settings that require it, including epoch GC.
+See the [upstream upgrade notes](https://github.com/denoland/celld/blob/v0.6.2/docs/README.md#upgrade-notes).
+
+Telemetry keeps the same `spec.telemetry` API. For v0.5+ images, the operator
+puts the OTLP collector URL in `CELLD_OTEL`; the removed `CELLD_OTEL_SINK`
+variable is emitted only for older versioned images. An omitted OTLP endpoint
+uses `http://localhost:4318`. Bucket telemetry still uses `CELLD_OTEL=1`.
+`spec.vars.secretRef` is supported only before v0.5. Newer celld versions
+reject `CELLD_VARS_FILE`, so migrate Worker bindings to the deployment's
+Wrangler `vars` configuration and remove `spec.vars` before upgrading.
+The operator reports an invalid configuration instead of starting a broken pod.
 
 The operator defaults to `durability: bucket` independently of celld's default.
 Fleet acknowledgement requires retained PVCs, at least three replicas and
@@ -260,10 +275,10 @@ celld has no metrics endpoint yet, so the operator polls each pod's internal
 | `celld_state_up` | 1 if `/state` answered the last poll |
 
 With `spec.autoscaling.enabled`, the operator materializes a KEDA
-ScaledObject over these series: scale up at the utilization target (or
-immediately when any pod sheds — celld has no rebalancer, so new capacity
-absorbs slowly and scaling early matters), scale down one pod per 5 minutes
-after a long stabilization window (30 min for `websockets: true` fleets,
+ScaledObject over these series: scale up at the utilization target or
+immediately when any pod sheds. Active-cell placement remains traffic-driven,
+while celld can rebalance hibernated cells onto new capacity. Scale down one
+pod per 5 minutes after a long stabilization window (30 min for `websockets: true` fleets,
 since a removed pod closes its sockets). During any rollout the ScaledObject
 is paused so KEDA and the partition controller never fight over replicas.
 

@@ -29,6 +29,9 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+const latestCelldTag = "v0.6.2"
+const preV06CelldTag = "v0.5.1"
+
 const testWorkerAppKind = "WorkerApp"
 const testAppHostname = "app.example.com"
 
@@ -497,5 +500,139 @@ func TestHTTPRouteRetryLatchExpires(t *testing.T) {
 	desired = buildHTTPRoute(app, "edge", "infra")
 	if r.configureHTTPRouteRetries(context.Background(), desired) || desired.Spec.Rules[0].Retry == nil {
 		t.Fatal("support not retried after latch expiry")
+	}
+}
+
+func TestLatestCelldTelemetry(t *testing.T) {
+	const endpoint = "https://collector:4318"
+	for _, tc := range []struct {
+		name, image, endpoint, want, legacy string
+		disabled                            bool
+	}{
+		{"latest collector", latestCelldTag, endpoint, endpoint, "", false},
+		{"v05 collector", "v0.5.0", endpoint, endpoint, "", false},
+		{"default collector", latestCelldTag, "", "http://localhost:4318", "", false},
+		{"legacy collector", "v0.4.0", endpoint, "1", "otlp", false},
+		{"disabled collector", latestCelldTag, endpoint, "0", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, app, _ := productionFixture(t)
+			app.Spec.Celld.Image = "ghcr.io/denoland/celld:" + tc.image
+			app.Spec.Telemetry = platformv1alpha1.TelemetrySpec{Sink: platformv1alpha1.TelemetrySinkOTLP, OTLPEndpoint: tc.endpoint, Enabled: ptr.To(!tc.disabled)}
+			env := map[string]string{}
+			for _, v := range buildPodTemplate(app, "", "deploy-a").Spec.Containers[0].Env {
+				env[v.Name] = v.Value
+			}
+			if env["CELLD_OTEL"] != tc.want || env["CELLD_OTEL_SINK"] != tc.legacy {
+				t.Fatalf("unexpected telemetry env: %v", env)
+			}
+			if tc.legacy == "" {
+				if _, ok := env["OTEL_EXPORTER_OTLP_ENDPOINT"]; ok {
+					t.Fatal("latest runtime ignores legacy endpoint")
+				}
+			}
+		})
+	}
+}
+
+func TestV06RolloutDurabilityBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name, from, to               string
+		oldDurability, newDurability platformv1alpha1.Durability
+		blocked                      bool
+	}{
+		{"bucket rolls", preV06CelldTag, latestCelldTag, platformv1alpha1.DurabilityBucket, platformv1alpha1.DurabilityBucket, false},
+		{"fleet stops", preV06CelldTag, latestCelldTag, platformv1alpha1.DurabilityFleet, platformv1alpha1.DurabilityFleet, true},
+		{"old followers remain when switching to bucket", preV06CelldTag, latestCelldTag, platformv1alpha1.DurabilityFleet, platformv1alpha1.DurabilityBucket, true},
+		{"enabling fleet during upgrade stops", preV06CelldTag, latestCelldTag, platformv1alpha1.DurabilityBucket, platformv1alpha1.DurabilityFleet, true},
+		{"fleet downgrade stops", latestCelldTag, preV06CelldTag, platformv1alpha1.DurabilityFleet, platformv1alpha1.DurabilityFleet, true},
+		{"latest patch rolls", "v0.6.1", latestCelldTag, platformv1alpha1.DurabilityFleet, platformv1alpha1.DurabilityFleet, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, app, sts := productionFixture(t)
+			app.Spec.Celld.Image = "ghcr.io/denoland/celld:" + tc.from
+			app.Spec.Durability = tc.oldDurability
+			app.Spec.Storage = nil
+			sts.Spec.Template = buildPodTemplate(app, "", app.Spec.AppVersion)
+			sts.Annotations[templateHashAnnotation] = templateHash(sts.Spec.Template)
+			if err := r.Update(context.Background(), sts); err != nil {
+				t.Fatal(err)
+			}
+			app.Spec.Celld.Image = "ghcr.io/denoland/celld:" + tc.to
+			app.Spec.Durability = tc.newDurability
+			out, err := r.reconcileFleet(context.Background(), app, app.Spec.AppVersion)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(out.WaitingOn, "not rolling-safe"); got != tc.blocked {
+				t.Fatalf("blocked=%v, want %v: %+v", got, tc.blocked, out)
+			}
+		})
+	}
+}
+
+func TestLatestCelldShutdownEnvironment(t *testing.T) {
+	_, app, _ := productionFixture(t)
+	for _, env := range buildPodTemplate(app, "", app.Spec.AppVersion).Spec.Containers[0].Env {
+		if env.Name == "CELLD_SHUTDOWN_DRAIN_MS" || env.Name == "CELLD_DRAIN_TOKEN_WAIT_MS" {
+			t.Fatalf("removed runtime setting %s prevents startup", env.Name)
+		}
+	}
+}
+
+func TestLatestCelldRejectsLegacyVars(t *testing.T) {
+	r, app, _ := productionFixture(t)
+	app.Spec.Vars = &platformv1alpha1.VarsSpec{SecretRef: "worker-vars"}
+	if err := r.validateApp(app); err == nil || !strings.Contains(err.Error(), "vars") {
+		t.Fatalf("removed variable injection should have a migration error: %v", err)
+	}
+	app.Spec.Celld.Image = "ghcr.io/denoland/celld:v0.4.0"
+	if err := r.validateApp(app); err != nil {
+		t.Fatalf("legacy vars stopped working: %v", err)
+	}
+}
+
+func TestRuntimeUpgradeChecksPodsDuringRollout(t *testing.T) {
+	for _, changeDurabilityFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("durability-first=%v", changeDurabilityFirst), func(t *testing.T) {
+			r, app, sts := productionFixture(t)
+			app.Spec.Celld.Image = "ghcr.io/denoland/celld:" + preV06CelldTag
+			app.Spec.Durability = platformv1alpha1.DurabilityBucket
+			if changeDurabilityFirst {
+				app.Spec.Durability = platformv1alpha1.DurabilityFleet
+			}
+			sts.Spec.Template = buildPodTemplate(app, "", app.Spec.AppVersion)
+			sts.Annotations[templateHashAnnotation] = templateHash(sts.Spec.Template)
+			if err := r.Update(context.Background(), sts); err != nil {
+				t.Fatal(err)
+			}
+			var pods corev1.PodList
+			if err := r.List(context.Background(), &pods, client.InNamespace(app.Namespace)); err != nil {
+				t.Fatal(err)
+			}
+			for i := range pods.Items {
+				pods.Items[i].Spec = sts.Spec.Template.Spec
+				if err := r.Update(context.Background(), &pods.Items[i]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if changeDurabilityFirst {
+				app.Spec.Durability = platformv1alpha1.DurabilityBucket
+			} else {
+				app.Spec.Celld.Image = testCelldImage
+			}
+			if out, err := r.reconcileFleet(context.Background(), app, app.Spec.AppVersion); err != nil || out.Phase == platformv1alpha1.PhaseDegraded {
+				t.Fatalf("first rolling change: %+v %v", out, err)
+			}
+			if changeDurabilityFirst {
+				app.Spec.Celld.Image = testCelldImage
+			} else {
+				app.Spec.Durability = platformv1alpha1.DurabilityFleet
+			}
+			out, err := r.reconcileFleet(context.Background(), app, app.Spec.AppVersion)
+			if err != nil || !strings.Contains(out.WaitingOn, "not rolling-safe") {
+				t.Fatalf("ignored incompatible live pods: %+v %v", out, err)
+			}
+		})
 	}
 }

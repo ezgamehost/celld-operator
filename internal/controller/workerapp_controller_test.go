@@ -38,7 +38,7 @@ import (
 )
 
 const (
-	testCelldImage = "ghcr.io/denoland/celld:v0.4.0"
+	testCelldImage = "ghcr.io/denoland/celld:v0.6.2"
 	// A v0.1 image: moving from it to testCelldImage crosses both
 	// stop-all boundaries (docs/celld-behaviors.md F8).
 	testCelldImageOld = "ghcr.io/denoland/celld:v0.1.0"

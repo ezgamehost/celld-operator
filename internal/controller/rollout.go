@@ -105,6 +105,68 @@ var breakingBoundaries = []versionBoundary{
 			"incompatible and v0.3 cannot read v0.4 large Workers KV value references); " +
 			"upstream requires stop-all-then-start",
 	},
+	{
+		lower: minorVersion{0, 4}, upper: minorVersion{0, 5}, upward: true, downward: true,
+		reason: "v0.4 and v0.5 nodes cannot share a fleet; upstream requires stop-all-then-start",
+	},
+}
+
+// fleetBreakingReason checks both pod templates: changing the desired proof
+// to bucket does not remove the old nodes' fleet replication streams.
+func fleetBreakingReason(existing, desired *appsv1.StatefulSet) string {
+	fromImage, toImage := stsContainerImage(existing), stsContainerImage(desired)
+	if reason := breakingReason(fromImage, toImage); reason != "" {
+		return reason
+	}
+	from, fromOK := minorOf(fromImage)
+	to, toOK := minorOf(toImage)
+	if !fromOK || !toOK {
+		return ""
+	}
+	crosses := (from.cmp(minorVersion{0, 6}) < 0 && to.cmp(minorVersion{0, 6}) >= 0) ||
+		(from.cmp(minorVersion{0, 6}) >= 0 && to.cmp(minorVersion{0, 6}) < 0)
+	if crosses && (usesFleetDurability(existing) || usesFleetDurability(desired)) {
+		return "v0.5 and v0.6 fleet replication streams are incompatible; stop the whole fleet first"
+	}
+	return ""
+}
+
+func usesFleetDurability(sts *appsv1.StatefulSet) bool {
+	for _, container := range sts.Spec.Template.Spec.Containers {
+		if container.Name != celldContainerName {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name == "CELLD_DURABILITY" {
+				return env.Value != string(platformv1alpha1.DurabilityBucket)
+			}
+		}
+	}
+	// celld defaults to fleet when no explicit proof is configured.
+	return true
+}
+
+// liveFleetBreakingReason includes pods left behind by an unfinished rollout.
+// A StatefulSet's template changes before its existing pods do.
+func (r *WorkerAppReconciler) liveFleetBreakingReason(ctx context.Context, app *platformv1alpha1.WorkerApp, existing, desired *appsv1.StatefulSet) (string, error) {
+	if reason := fleetBreakingReason(existing, desired); reason != "" {
+		return reason, nil
+	}
+	var pods corev1.PodList
+	if err := r.Reader.List(ctx, &pods, client.InNamespace(app.Namespace), client.MatchingLabels(selectorLabels(app))); err != nil {
+		return "", err
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !metav1.IsControlledBy(pod, existing) {
+			continue
+		}
+		live := &appsv1.StatefulSet{Spec: appsv1.StatefulSetSpec{Template: corev1.PodTemplateSpec{Spec: pod.Spec}}}
+		if reason := fleetBreakingReason(live, desired); reason != "" {
+			return fmt.Sprintf("pod %s: %s", pod.Name, reason), nil
+		}
+	}
+	return "", nil
 }
 
 // fleetOutcome is what one reconcile pass concluded about the fleet.
@@ -296,7 +358,6 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 	desiredHash := desired.Annotations[templateHashAnnotation]
 	templateChanged := existing.Annotations[templateHashAnnotation] != desiredHash
 	oldImage := stsContainerImage(&existing)
-	imageChanged := oldImage != "" && oldImage != app.Spec.Celld.Image
 
 	if templateChanged || stsPartition(&existing) > 0 || existing.Annotations[recreateAnnotation] == annotationTrue || (!autoscalingEnabled(app) && ptr.Deref(existing.Spec.Replicas, 0) != desiredReplicas(app)) {
 		paused, err := r.pauseScaling(ctx, app)
@@ -314,9 +375,9 @@ func (r *WorkerAppReconciler) reconcileFleet(ctx context.Context, app *platformv
 		return r.recreateStep(ctx, app, &existing, desired, "")
 	}
 	if templateChanged {
-		var breaking string
-		if imageChanged {
-			breaking = breakingReason(oldImage, app.Spec.Celld.Image)
+		breaking, err := r.liveFleetBreakingReason(ctx, app, &existing, desired)
+		if err != nil {
+			return fleetOutcome{}, err
 		}
 		if breaking != "" && app.Spec.Celld.UpdateStrategy != platformv1alpha1.UpdateStrategyRecreate {
 			// Refuse: a rolling update across this boundary creates the
