@@ -636,3 +636,22 @@ func TestRuntimeUpgradeChecksPodsDuringRollout(t *testing.T) {
 		})
 	}
 }
+
+func TestFleetDurabilityPinsNodeID(t *testing.T) {
+	_, app, _ := productionFixture(t)
+	for durability, want := range map[platformv1alpha1.Durability]string{
+		platformv1alpha1.DurabilityFleet:  "$(POD_NAME)",
+		platformv1alpha1.DurabilityBucket: "",
+	} {
+		app.Spec.Durability = durability
+		got := ""
+		for _, e := range buildPodTemplate(app, "", app.Spec.AppVersion).Spec.Containers[0].Env {
+			if e.Name == "CELLD_NODE" {
+				got = e.Value
+			}
+		}
+		if got != want {
+			t.Errorf("%s: CELLD_NODE=%q, want %q", durability, got, want)
+		}
+	}
+}
