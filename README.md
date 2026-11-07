@@ -255,6 +255,14 @@ The operator reports an invalid configuration instead of starting a broken pod.
 The operator defaults to `durability: bucket` independently of celld's default.
 Fleet acknowledgement requires retained PVCs, at least three replicas and
 required host separation; optional required zone separation is available.
+With fleet durability the operator sets `CELLD_NODE` to the pod name, which
+stays paired with the pod's `watch` PVC, so after a fleet-wide restart (for
+example every pod self-fencing during a store outage) each restarted node can
+answer for its predecessor's logs and recovery can seal
+([denoland/celld#249](https://github.com/denoland/celld/issues/249)). The
+guarantee holds only while the id and the disk stay together: do not override
+`CELLD_NODE`, rename the StatefulSet, or reattach a PVC to a different ordinal
+on an existing fleet.
 
 ## Autoscaling
 

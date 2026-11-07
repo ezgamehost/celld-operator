@@ -193,6 +193,12 @@ func buildPodTemplate(app *platformv1alpha1.WorkerApp, configHash, appVersion st
 		// follows upstream unless the CR pins a proof (F13).
 		env = append(env, corev1.EnvVar{Name: "CELLD_DURABILITY", Value: string(durability)})
 	}
+	if durability == platformv1alpha1.DurabilityFleet {
+		// The pod name is stable with its watch PVC; a random id per start
+		// cannot answer for its predecessor's logs after a fleet-wide
+		// restart, so recovery refuses to seal (F13, denoland/celld#249).
+		env = append(env, corev1.EnvVar{Name: "CELLD_NODE", Value: "$(POD_NAME)"})
+	}
 	if app.Spec.TrustForwardedHeaders {
 		// Off unless asked: celld reads the last value of each header, so
 		// this is only safe when every proxy hop replaces both.
